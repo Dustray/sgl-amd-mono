@@ -65,6 +65,7 @@
   "bundled_monokernel_specs": [
     {
       "name": "gfx936_bf16_dense_qwen",
+      "status": "experimental_unaccepted",
       "implementation": "DTK HIP cooperative K1/K2",
       "gpu_arch": "gfx936",
       "persistent_blocks": 80,

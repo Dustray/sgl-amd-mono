@@ -2,6 +2,7 @@ import ast
 import hashlib
 from importlib import metadata, resources, util
 import json
+import os
 from pathlib import Path
 
 
@@ -170,6 +171,9 @@ def probe(model_path, tp_size=1, device=None):
     specs = manifest()["bundled_monokernel_specs"]
     if not any(spec.get("name") == "gfx936_bf16_dense_qwen" for spec in specs):
         mono_reasons.append("Dense BF16 Monokernel spec is missing")
+    experimental_dense = os.environ.get("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE") == "1"
+    if not experimental_dense:
+        mono_reasons.append("The dense BF16 prototype has not passed acceptance; experimental runs require SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1")
     return {
         "contract": contract,
         "device": device,
@@ -186,6 +190,8 @@ def probe(model_path, tp_size=1, device=None):
         },
         "upstream": upstream,
         "monokernel_eligible": not mono_reasons,
+        "monokernel_acceptance": "not_accepted_experimental",
+        "experimental_dense_opt_in": experimental_dense,
         "disable_reasons": mono_reasons,
         "documented_upstream_disable_reasons": reasons,
         "execution_path": "sglang_original",
@@ -198,6 +204,8 @@ def probe(model_path, tp_size=1, device=None):
 def validate(report, mode):
     if report["contract"]["errors"]:
         raise ContractError("; ".join(report["contract"]["errors"]))
+    if mode == "required" and report.get("monokernel_acceptance") != "accepted":
+        raise UnsupportedConfiguration("Strict Monokernel mode refuses the unaccepted dense BF16 prototype; see LOCAL_DEVELOPMENT.md")
     if mode in {"required", "monokernel"} and not report["monokernel_eligible"]:
         raise UnsupportedConfiguration("Monokernel startup refused:\n- " + "\n- ".join(report["disable_reasons"]))
     if mode == "fused_ffn" and not report["fused_ffn_eligible"]:

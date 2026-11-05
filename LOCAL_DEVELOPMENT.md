@@ -22,7 +22,8 @@
 
 - `audit`：走原生 SGLang，记录兼容契约与权重观察。
 - `fused_ffn`：此前验证过的 FFN 局部融合，仍不是完整 Monokernel。旧生成对照为 9/12 逐 token 一致，不能写成完整模型精度已通过。
-- `monokernel` / `required`：包含自行编写的 K1/K2 原型，**尚未完成整模型验收，默认拒绝启动**。仅设置 `SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1` 才允许继续实验，启动后仍执行真实权重检查。
+- `monokernel`：包含自行编写的 K1/K2 原型，**尚未完成整模型验收，默认拒绝启动**。仅设置 `SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1` 才允许继续实验，启动后仍执行真实权重检查。
+- `required`：严格模式始终拒绝当前未验收的原型，即使设置实验环境变量也不会放行。
 
 最新一次 dense 原型启动在 K2 检查中失败，测得 NRMSE `0.0038988393`，高于当时设置的 `0.003`。此前的整模型试验也曾超过 2% logits NRMSE。代码中尝试过基于 KL、cosine 和逐段误差的验收方式，但尚未据此完成通过的整模型验收；这些改动也保存在迁移快照中，不作为性能测试前提已满足的证明。
 
