@@ -1,0 +1,94 @@
+{
+  "sglang_version": "0.5.18+dtk2604.torch2110.2609201917.g2b8d2b",
+  "sglang_files": {
+    "srt/plugins/__init__.py": "3a975a73f1a7887e68c81ea7a2530250597ac8ae978efc0b0f70f038a99a3164",
+    "srt/plugins/hook_registry.py": "fe214acac324cb2f019aa1dffe1ddcb6e4691862fdd1b6a0ad5033d8167e31e9",
+    "srt/server_args.py": "50a7b9f5f61392348fb5d77208f99cbe2a2868f305d4097e25bbb530c6e04f81",
+    "srt/model_loader/loader.py": "95586bc3f53c7e93c6a6eb15b91b4d16dd78df0ec5fc83b27ab02c477ec4dd10",
+    "srt/model_executor/model_runner.py": "167d3be16add3c8b7a794d0b86dd3a7b3b5713b1ced8dcc3d7a7f9084210bd3b",
+    "srt/models/qwen3_5.py": "17edfe08a9bde4e7c1c677589189515547f98360233a8c7c2a5acfbea9ef992e",
+    "srt/managers/scheduler.py": "b0f4963ab8b39d0c0b93d9fe88b832f3c0b47c3dbfb148ad291315519e368a38",
+    "srt/models/qwen2_moe.py": "89b668bf81a1ca2ab27369879fd7f97b81f19be273c2bcb6cee6ff9e112f7cbe",
+    "srt/layers/linear.py": "0932d8f142e11d5aba61b09b7f3873fac13194d6995cb82836631869e10938f2",
+    "srt/layers/activation.py": "4d0d9d67d1fc4ecb624064666948a45634735b9fb9ca7cf5ea0995d0b518c80c",
+    "srt/layers/quantization/unquant.py": "aa7efaf173acb434f12129100e7a2c5093f4985076d8d402714a85226c96d010",
+    "srt/layers/layernorm.py": "a63b0cb16342f6701e7555d45f47fe1c770202bddd3d6bbbde2ac82b52559218",
+    "srt/layers/attention/linear/gdn_backend.py": "58d65445b79de1299fc9945a6f69137b6b59c41c57cbfee5ee9aaf3169564bfb",
+    "srt/layers/attention/linear/kernels/gdn_triton.py": "a4239b752afe1433e306859d2fd439f95d26c510851fd5b94c3d2823feb141db",
+    "srt/layers/attention/hybrid_linear_attn_backend.py": "72a7c2a83278494f02add279622a467a4fc62b66c0910676896209aebc85815e",
+    "srt/layers/radix_linear_attention.py": "4af975b5e0ea2b17505920a43509372200fffc62eebed2e4b04346175710a179",
+    "srt/model_executor/forward_context.py": "63900e43eaf683bcc50991e56dac6d194566b9fcef2ed452ff8e5818e503d2d0",
+    "srt/mem_cache/memory_pool.py": "e05e43326cef0c0ee2a0d16b5d8ba15bd0887ebdd96bfc713b76e774f8031c70",
+    "kernels/ops/attention/fla/fused_recurrent.py": "c558c8615e2da2039f95b20ce0f132bbe15bb3c752863dc2938408070c69341b",
+    "kernels/ops/attention/fla/layernorm_gated.py": "b5bd6512b4f7b12e2b351dfa18a3ea123cd081ee8f344fa313bb9d9b93750005",
+    "kernels/ops/attention/triton_gdn_fused_proj.py": "3b5451f657c00e1ae4d6e582748e326070825698b87c423542bf59ea67329161"
+  },
+  "upstream": {
+    "repository": "https://github.com/sgl-project/sgl-amd-mono",
+    "document_revision": "8f1bff3c06f8467cda1512122844d58d389ad7ca",
+    "reviewed_main_revision": "ca929b7dcc4a955a7f4204d209fe303422a00351",
+    "document_target": {
+      "architecture": "DeepseekV4ForCausalLM",
+      "model_type": "deepseek_v41",
+      "gpu_arch": "gfx950",
+      "tp_size": 4
+    },
+    "reviewed_qwen_target": {
+      "architecture": "Qwen4ExpForConditionalGeneration",
+      "gpu_arch": "gfx950",
+      "quant_method": "quark",
+      "coverage": "NEXTN target_verify; 48 layers; MXFP4 experts and FP8 projections"
+    },
+    "reviewed_dense_qwen_pr": {
+      "repository": "https://github.com/sgl-project/sglang",
+      "number": 43558,
+      "head_revision": "b25e92fd224a196bf610ac05405073208ff7d513",
+      "state": "closed",
+      "merged": false,
+      "architecture": "Qwen3_5ForConditionalGeneration",
+      "hidden_size": 5120,
+      "intermediate_size": 17408,
+      "gpu_arch": "gfx950",
+      "quant_method": "QuarkW4A4MXFP4",
+      "persistent_blocks": 256,
+      "tp_sizes": [1, 2]
+    }
+  },
+  "validated_local_flydsl": {
+    "version": "0.2.0+dtk2604.torch2110.2610101749.gad9161",
+    "wheel_sha256": "4c1ed83b8fd05285273d769c0e4000bf7ba68107048e0373a89edc2acb52ad74",
+    "python_abi": "cp310",
+    "gpu_arch": "gfx936",
+    "scope": "BF16 MMA and SiLU-mul primitives; experimental two-launch BF16 FFN compiled in an isolated process",
+    "verification_script": "tools/verify_flydsl_gfx936.py"
+  },
+  "bundled_monokernel_specs": [
+    {
+      "name": "gfx936_bf16_dense_qwen",
+      "implementation": "DTK HIP cooperative K1/K2",
+      "gpu_arch": "gfx936",
+      "persistent_blocks": 80,
+      "threads": 256,
+      "tp_size": 1,
+      "decode_rows": [1, 2],
+      "dtype": "bfloat16",
+      "architecture": "Qwen3_5ForConditionalGeneration",
+      "gdn_layers": 48,
+      "k2_layers": 64,
+      "kernels_per_decode_forward": 112,
+      "native_components": ["full-attention QKV/RoPE/FA3/gate", "final norm", "embedding", "LM head", "prefill", "mamba prefix-state tracking"],
+      "activation": "startup requires all-layer real-weight numerical validation"
+    }
+  ],
+  "experimental_fusions": [
+    {
+      "name": "gfx936_bf16_dense_ffn",
+      "mode": "fused_ffn",
+      "scope": "gate/up GEMV, BF16 SiLU-mul and partitioned down GEMV; reduction in a second launch",
+      "whole_model_monokernel": false,
+      "decode_rows": [1, 2],
+      "tp_size": 1,
+      "extra_weight_copies": 0
+    }
+  ]
+}
