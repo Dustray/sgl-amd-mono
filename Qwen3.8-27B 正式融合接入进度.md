@@ -2,6 +2,18 @@
 
 更新日期：2026-11-05。
 
+## 源码与版本管理现状
+
+当前目录已改为真实 `sgl-project/sgl-amd-mono` Git 工作区，保留上游完整历史；上游 remote 为 `upstream`，基线为 `e52803f9d2b7dabff4bfd2f53ec25c03d56af947`，开发分支为 `local/sglang-0.5.18-gfx936`。迁移前代码有 `standalone-snapshot-20261105` tag 及完整 tar 备份。
+
+原先独立编写的代码统一收进 `compat/sglang0518/`。上游 `sgl_amd_mono/` 的 kernel 计算实现当前保持原样。逐项修改、安装和升级命令见根目录 `LOCAL_CHANGES.md`、`LOCAL_DEVELOPMENT.md`；通过 `git diff upstream-base-20261105..HEAD` 可以直接审阅所有本地差异。
+
+**新增的 dense K1/K2 是自行编写的 DTK HIP 原型，尚未完成验收，不是上游 kernel 直接移植的成功结果。** 最近一次启动在 K2 真实权重检查中测得 NRMSE `0.0038988393`，超过 `0.003` 阈值；整模型试验也有超过原先 2% logits NRMSE 的样本。源码保留这些试验及其验收条件变更，默认严格模式拒绝启用该原型。性能测试仍未开始。
+
+下文保留此前 FFN 阶段记录；其中旧路径 `src/sgl_amd_mono_0518/` 现统一位于 `compat/sglang0518/src/sgl_amd_mono_0518/`，旧 wheel 和报告不代表最新 Git 分支的完整融合验收。
+
+## 此前 FFN 阶段记录
+
 已实现 gfx936 上真实的 BF16 dense FFN 融合，并接入 `fused_ffn` 模式；decode batch 1/2 进入自定义 GPU kernel，prefill 保留原始路径。**目前完成的是 FFN 部分融合；GDN、全注意力、residual/norm 尚未融合，完整 Monokernel 仍未完成。性能对比尚未开始。**
 
 ## 本次 FFN 实现

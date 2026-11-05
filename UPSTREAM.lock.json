@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/sgl-project/sgl-amd-mono.git",
+  "remote": "upstream",
+  "branch": "main",
+  "base_commit": "e52803f9d2b7dabff4bfd2f53ec25c03d56af947",
+  "base_commit_date": "2026-11-04T13:11:22-07:00",
+  "fetched_on": "2026-11-05",
+  "local_branch": "local/sglang-0.5.18-gfx936",
+  "baseline_tag": "upstream-base-20261105",
+  "standalone_snapshot_tag": "standalone-snapshot-20261105",
+  "compatibility_project": "compat/sglang0518",
+  "compatibility_module": "sgl_amd_mono_0518",
+  "dense_qwen_reference": {
+    "repository": "https://github.com/sgl-project/sglang.git",
+    "pull_request": 43558,
+    "commit": "b25e92fd224a196bf610ac05405073208ff7d513",
+    "path": "python/sglang/srt/layers/qwen3_8_dense_mono.py",
+    "included_in_monokernel_repository": false,
+    "note": "Reference for gfx950 Quark MXFP4 dense Qwen; local BF16 HIP prototype is independently written"
+  },
+  "pre_migration_backup": {
+    "path": "monokernel_reports/migration/workspace-before-source-migration.tar.gz",
+    "sha256": "a1952362afd4f02a4027319308c9099bbb9dc2e546dca140df5f8ee3df2ab309"
+  }
+}

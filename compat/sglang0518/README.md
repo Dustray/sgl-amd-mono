@@ -1,5 +1,7 @@
 # SGLang 0.5.18 兼容审计与 gfx936 BF16 FFN 融合插件
 
+本项目现已纳入真实 Monokernel 上游仓库的本地 Git 分支。源码基线、改动归属和升级命令见根目录 `LOCAL_DEVELOPMENT.md`、`LOCAL_CHANGES.md`、`UPSTREAM.lock.json`。本 README 中的历史验证记录仅针对相应旧实验；新增 dense K1/K2 原型尚未验收，默认禁止使用，不能据此称完整 Monokernel 已完成。
+
 当前包包含兼容审计模式和实验性 `fused_ffn` 模式。后者通过真实 FlyDSL kernel 融合 Qwen3.8-27B 的 BF16 dense FFN，每层使用两次 GPU launch，覆盖 decode batch 1/2。**GDN、全注意力、residual 和 norm 继续使用 SGLang；完整模型 Monokernel 尚未完成，尚无加速结论。**
 
 当前硬件是海光 `gfx936`，模型是 `Qwen3_5ForConditionalGeneration` / `qwen3_5`、BF16、64 层、TP1。文档固定的上游版本只覆盖 gfx950 / DeepSeek-V4.1-Flash。核对的上游主分支虽有 Qwen kernel，但对应 `Qwen4ExpForConditionalGeneration`、gfx950、Quark MXFP4/FP8、48 层及 NEXTN verify，不覆盖这里的 Qwen3.8-27B。
@@ -9,11 +11,11 @@
 ## 安装
 
 ```bash
-python -m pip install --no-deps --no-build-isolation -e .
-python -m pip wheel --no-deps --no-build-isolation -w dist .
+python -m pip install --no-deps --no-build-isolation -e compat/sglang0518
+python -m pip wheel --no-deps --no-build-isolation -w dist compat/sglang0518
 ```
 
-插件以 `sglang.srt.plugins` entry point 自动发现。未设置 `SGLANG_AMD_MONO_0518=1` 时不注册 hook。安装和运行均不修改 `site-packages/sglang` 文件；manifest 固定当前 DTK 下游 wheel 的版本及十一个关键源码文件 SHA256，并核对四个 hook 目标的签名。
+上述命令在仓库根目录执行。插件以 `sglang.srt.plugins` entry point 自动发现。未设置 `SGLANG_AMD_MONO_0518=1` 时不注册 hook。安装和运行均不修改 `site-packages/sglang` 文件；manifest 固定当前 DTK 下游 wheel 的版本及 21 个关键源码文件 SHA256，并核对四个 hook 目标的签名。
 
 ### 当前 Python 3.10 环境的 FlyDSL
 
@@ -113,7 +115,7 @@ SGLANG_AMD_MONO_0518=0 bash launch_qwen_monokernel.sh
 
 要完成上游两段式 GDN/FFN 覆盖，还需要融合 GDN 输入投影、卷积与 SSM 状态、gated norm，以及 FFN 前后的输出投影和 residual/norm，并完成状态及 logits 验证。当前 FFN 融合已覆盖 dense MLP；全注意力 KV 布局继续由 SGLang 管理。当前包未回移上游 runtime、peer memory、mailbox 或 fail-stop kernel；上游 gfx950 kernel 也未被安装或改名注册到当前模型。
 
-上游固定版本及核对的主分支 revision 保存在 `src/sgl_amd_mono_0518/manifest.json`。回移设计文档与当前落地状态应分开评估。
+此前核对的上游 revision 保存在 `compat/sglang0518/src/sgl_amd_mono_0518/manifest.json`，本次真实克隆的基线另固定在根目录 `UPSTREAM.lock.json`。回移设计文档与当前落地状态应分开评估。
 
 ## 审计模式验证记录
 

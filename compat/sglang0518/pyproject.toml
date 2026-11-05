@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgl-amd-mono-sglang0518"
-version = "0.1.0"
+version = "0.1.0+gfx936.20261105"
 description = "gfx936 BF16 dense Qwen cooperative Monokernel integration for SGLang 0.5.18 DTK"
 readme = "README.md"
 requires-python = ">=3.10"

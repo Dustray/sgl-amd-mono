@@ -4,3 +4,11 @@ build/
 dist/
 .pytest_cache/
 .ruff_cache/
+/.upstream-source-staging/
+/monokernel_reports/
+/benchmark_results/
+/*.log
+/*.pid
+/monokernel_contract.json
+/monokernel_serving_verification.json
+/core*

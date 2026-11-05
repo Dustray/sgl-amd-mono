@@ -1,5 +1,7 @@
 # SGLang-AMD-Mono
 
+> 本地 SGLang 0.5.18 / gfx936 开发分支的源码基线、改动清单和升级流程见 [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md)。现有兼容代码位于 `compat/sglang0518/`；完整 BF16 dense 路径仍是未验收的实验实现。
+
 ## Introduction
 
 **SGLang-AMD-Mono** is the monokernel library of the [SGLang](https://github.com/sgl-project/sglang) framework for AMD Instinct GPUs. A monokernel is a persistent kernel that runs most of a decoder layer, including its attention, its mixture-of-experts block and both tensor-parallel all-reduces, in one or two launches. This removes the launch gaps and collective latency that dominate small-batch decoding.
