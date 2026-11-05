@@ -2,6 +2,8 @@
 
 本项目现已纳入真实 Monokernel 上游仓库的本地 Git 分支。源码基线、改动归属和升级命令见根目录 `LOCAL_DEVELOPMENT.md`、`LOCAL_CHANGES.md`、`UPSTREAM.lock.json`。本 README 中的历史验证记录仅针对相应旧实验；新增 dense K1/K2 原型尚未验收，默认禁止使用，不能据此称完整 Monokernel 已完成。
 
+模型计算、权重检查及 GPU 验证现由根包 `sgl_amd_mono/qwen38_27b/` 维护。本目录保留旧版 SGLang 的 hook、契约与启动入口；旧计算模块仅转发到根包。安装时需要同时安装下面两个项目。
+
 当前包包含兼容审计模式和实验性 `fused_ffn` 模式。后者通过真实 FlyDSL kernel 融合 Qwen3.8-27B 的 BF16 dense FFN，每层使用两次 GPU launch，覆盖 decode batch 1/2。**GDN、全注意力、residual 和 norm 继续使用 SGLang；完整模型 Monokernel 尚未完成，尚无加速结论。**
 
 当前硬件是海光 `gfx936`，模型是 `Qwen3_5ForConditionalGeneration` / `qwen3_5`、BF16、64 层、TP1。文档固定的上游版本只覆盖 gfx950 / DeepSeek-V4.1-Flash。核对的上游主分支虽有 Qwen kernel，但对应 `Qwen4ExpForConditionalGeneration`、gfx950、Quark MXFP4/FP8、48 层及 NEXTN verify，不覆盖这里的 Qwen3.8-27B。
@@ -11,8 +13,8 @@
 ## 安装
 
 ```bash
-python -m pip install --no-deps --no-build-isolation -e compat/sglang0518
-python -m pip wheel --no-deps --no-build-isolation -w dist compat/sglang0518
+python -m pip install --no-deps --no-build-isolation -e . -e compat/sglang0518
+python -m pip wheel --no-deps --no-build-isolation -w dist . compat/sglang0518
 ```
 
 上述命令在仓库根目录执行。插件以 `sglang.srt.plugins` entry point 自动发现。未设置 `SGLANG_AMD_MONO_0518=1` 时不注册 hook。安装和运行均不修改 `site-packages/sglang` 文件；manifest 固定当前 DTK 下游 wheel 的版本及 21 个关键源码文件 SHA256，并核对四个 hook 目标的签名。

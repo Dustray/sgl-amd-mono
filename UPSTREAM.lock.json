@@ -11,6 +11,8 @@
   "standalone_snapshot_tag": "standalone-snapshot-20261105",
   "compatibility_project": "compat/sglang0518",
   "compatibility_module": "sgl_amd_mono_0518",
+  "model_project": "sgl_amd_mono/qwen38_27b",
+  "model_module": "sgl_amd_mono.qwen38_27b",
   "dense_qwen_reference": {
     "repository": "https://github.com/sgl-project/sglang.git",
     "pull_request": 43558,

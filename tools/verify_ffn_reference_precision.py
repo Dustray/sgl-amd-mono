@@ -7,7 +7,7 @@ import torch
 from lightop import fuse_silu_and_mul
 from safetensors import safe_open
 
-from sgl_amd_mono_0518.hip_ffn import FusedBF16FFN, numerical_error
+from sgl_amd_mono.qwen38_27b.gfx936.ffn import FusedBF16FFN, numerical_error
 
 
 def main():

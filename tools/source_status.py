@@ -23,6 +23,13 @@ def main():
     expected_package = ROOT / lock["compatibility_project"] / "src" / lock["compatibility_module"] / "__init__.py"
     spec = util.find_spec(lock["compatibility_module"])
     imported_package = Path(spec.origin).resolve() if spec is not None and spec.origin else None
+    model_module = lock["model_module"]
+    try:
+        model_spec = util.find_spec(model_module)
+    except ModuleNotFoundError:
+        model_spec = None
+    imported_model = Path(model_spec.origin).resolve() if model_spec is not None and model_spec.origin else None
+    expected_model = ROOT / lock["model_project"] / "__init__.py"
     ancestor = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", lock["base_commit"], "HEAD"], capture_output=True).returncode == 0
     changed_paths = git("diff", "--name-only", lock["base_commit"], "--").splitlines()
     status = git("status", "--short")
@@ -36,6 +43,8 @@ def main():
         "upstream_kernel_source_changes": [path for path in changed_paths if path.startswith("sgl_amd_mono/")],
         "compatibility_import": str(imported_package) if imported_package else None,
         "expected_compatibility_import": str(expected_package),
+        "model_import": str(imported_model) if imported_model else None,
+        "expected_model_import": str(expected_model),
         "working_tree": status,
         "diff_stat": git("diff", "--stat", lock["base_commit"], "--"),
         "errors": [],
@@ -56,6 +65,13 @@ def main():
         report["sglang_file_hashes_checked"] = len(contract["file_hashes"])
         report["errors"].extend(contract["errors"])
         report["compatibility_distribution_version"] = metadata.version("sgl-amd-mono-sglang0518")
+    if imported_model != expected_model:
+        report["errors"].append("Install the model project from this checkout: pip install --no-deps --no-build-isolation -e .")
+    else:
+        try:
+            report["model_distribution_version"] = metadata.version("sgl-amd-mono")
+        except metadata.PackageNotFoundError:
+            report["errors"].append("Model distribution metadata is missing; install the root project")
     if arguments.require_clean and status:
         report["errors"].append("Working tree has uncommitted or untracked changes")
     print(json.dumps(report, ensure_ascii=False, indent=2))

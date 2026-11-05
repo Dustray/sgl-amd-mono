@@ -9,9 +9,9 @@ from safetensors import safe_open
 
 os.environ.setdefault("SGLANG_USE_AITER_LINEAR_ATTN", "1")
 
-from sgl_amd_mono_0518.hip_monokernel import DenseK1, DenseK2
-from sgl_amd_mono_0518.hip_ffn import numerical_error
-from sgl_amd_mono_0518.mono_validation import native_k1, native_k2
+from sgl_amd_mono.qwen38_27b.gfx936.program import DenseK1, DenseK2
+from sgl_amd_mono.qwen38_27b.gfx936.ffn import numerical_error
+from sgl_amd_mono.qwen38_27b.gfx936.check import native_k1, native_k2
 
 
 def main():

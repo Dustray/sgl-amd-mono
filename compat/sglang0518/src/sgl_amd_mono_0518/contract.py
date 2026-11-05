@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+from sgl_amd_mono.qwen38_27b.errors import ContractError, UnsupportedConfiguration
+from sgl_amd_mono.qwen38_27b import spec as model_spec
 
 HOOK_TARGETS = (
     "sglang.srt.server_args.ServerArgs.resolve_once",
@@ -12,14 +14,6 @@ HOOK_TARGETS = (
     "sglang.srt.model_executor.model_runner.ModelRunner.initialize",
     "sglang.srt.managers.scheduler.Scheduler.get_internal_state",
 )
-
-
-class ContractError(RuntimeError):
-    pass
-
-
-class UnsupportedConfiguration(RuntimeError):
-    pass
 
 
 def manifest():
@@ -142,38 +136,13 @@ def probe(model_path, tp_size=1, device=None):
     reasons.append(
         "The documented gfx950 Monokernel spec is not bundled; local gfx936 dense support is checked separately"
     )
-    ffn_reasons = []
-    if device["gpu_arch"] != "gfx936":
-        ffn_reasons.append("BF16 FFN fusion has only been validated on gfx936")
     expected_flydsl = manifest()["validated_local_flydsl"]["version"]
-    if device.get("flydsl_version") != expected_flydsl:
-        ffn_reasons.append(f"BF16 FFN fusion requires validated FlyDSL {expected_flydsl}")
-    if (
-        architectures != ["Qwen3_5ForConditionalGeneration"]
-        or config.get("model_type") != "qwen3_5"
-        or text.get("hidden_size") != 5120
-        or text.get("intermediate_size") != 17408
-        or text.get("num_hidden_layers") != 64
-        or text.get("hidden_act") != "silu"
-        or text.get("dtype", text.get("torch_dtype")) != "bfloat16"
-        or config.get("quantization_config")
-        or text.get("quantization_config")
-    ):
-        ffn_reasons.append("BF16 FFN fusion requires the validated dense Qwen3_5 BF16 27B configuration")
-    if tp_size != 1:
-        ffn_reasons.append("BF16 FFN fusion currently requires TP1")
-    mono_reasons = [reason for reason in ffn_reasons if "FlyDSL" not in reason]
-    if device.get("gpu_compute_units") != 80:
-        mono_reasons.append("Dense cooperative Monokernel requires the validated 80-CU grid")
-    expected_dimensions = {"linear_num_key_heads": 16, "linear_num_value_heads": 48, "linear_key_head_dim": 128, "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256, "rms_norm_eps": 1e-6}
-    if any(text.get(name) != value for name, value in expected_dimensions.items()):
-        mono_reasons.append("Dense Monokernel attention/state dimensions or RMSNorm epsilon mismatch")
+    ffn_reasons = model_spec.ffn_disable_reasons(config, tp_size, device, expected_flydsl)
+    mono_reasons = model_spec.dense_disable_reasons(config, tp_size, device, expected_flydsl)
     specs = manifest()["bundled_monokernel_specs"]
     if not any(spec.get("name") == "gfx936_bf16_dense_qwen" for spec in specs):
         mono_reasons.append("Dense BF16 Monokernel spec is missing")
     experimental_dense = os.environ.get("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE") == "1"
-    if not experimental_dense:
-        mono_reasons.append("The dense BF16 prototype has not passed acceptance; experimental runs require SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1")
     return {
         "contract": contract,
         "device": device,
@@ -189,6 +158,7 @@ def probe(model_path, tp_size=1, device=None):
             "tp_size": tp_size,
         },
         "upstream": upstream,
+        "model_implementation": "sgl_amd_mono.qwen38_27b",
         "monokernel_eligible": not mono_reasons,
         "monokernel_acceptance": "not_accepted_experimental",
         "experimental_dense_opt_in": experimental_dense,

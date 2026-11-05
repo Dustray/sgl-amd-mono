@@ -59,7 +59,16 @@ def register_specs() -> None:
     try:
         from sglang.kernels.plugin_kernels.amd.spec import register
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.monokernels.spec import register
+        try:
+            from sglang.srt.monokernels.spec import register
+        except ModuleNotFoundError as error:
+            if error.name not in {"sglang.srt.monokernels", "sglang.srt.monokernels.spec"}:
+                raise
+            if os.environ.get("SGLANG_AMD_MONO_0518", "0") == "1":
+                from sgl_amd_mono_0518.bootstrap import register as register_legacy
+
+                register_legacy()
+            return
 
     for (architecture, model_type), path in SPECS.items():
         register(

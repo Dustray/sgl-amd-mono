@@ -1,6 +1,6 @@
 # SGLang-AMD-Mono
 
-> 本地 SGLang 0.5.18 / gfx936 开发分支的源码基线、改动清单和升级流程见 [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md)。现有兼容代码位于 `compat/sglang0518/`；完整 BF16 dense 路径仍是未验收的实验实现。
+> 本地 SGLang 0.5.18 / gfx936 开发分支的源码基线、改动清单和升级流程见 [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md)。Qwen 27B 实现位于 [sgl_amd_mono/qwen38_27b/](sgl_amd_mono/qwen38_27b/README.md)，旧版接口桥接位于 `compat/sglang0518/`；完整 BF16 dense 路径仍是未验收的实验实现。
 
 ## Introduction
 

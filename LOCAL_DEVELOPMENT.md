@@ -8,15 +8,17 @@
 
 | 路径 | 来源与用途 |
 | --- | --- |
-| `sgl_amd_mono/`、`test/` 等原有目录 | 真实上游源码及其历史；当前没有修改上游 kernel 的计算实现 |
-| `compat/sglang0518/src/sgl_amd_mono_0518/` | 之前独立编写的兼容层、FFN 和 dense HIP 实验代码，现已进入 Git |
-| `compat/sglang0518/pyproject.toml` | 本机兼容项目的独立安装入口；当前 SGLang 缺少上游新版 Monokernel API |
+| `sgl_amd_mono/` 的原有模型与 common | 真实上游源码及其历史；原有计算实现保持原样 |
+| `sgl_amd_mono/qwen38_27b/` | 本地新增模型目录，包含 spec、权重检查、gfx936 计算、runner 和 check；迁入的计算代码仍是原本地实现 |
+| `sgl_amd_mono/__init__.py` | 插件入口增加旧版接口桥接；新版 spec 注册列表不变 |
+| `compat/sglang0518/src/sgl_amd_mono_0518/` | 旧版 hook、契约检查和启动入口；原计算模块现在仅转发到模型目录 |
+| `compat/sglang0518/pyproject.toml` | 兼容项目安装入口，依赖同一工作区的根模型包 |
 | `tools/verify_*.py`、`tools/source_status.py` | 本地验证和来源检查工具 |
 | `launch_qwen*.sh` | 本机模型启动配置；融合脚本使用本地兼容入口 |
 | `LOCAL_CHANGES.md`、本地中文文档 | 改动归属、实际验收状态及升级说明 |
 | `monokernel_reports/`、`benchmark_results/`、日志及 PID | 运行产物，已在 Git 中忽略，不混入源码提交 |
 
-`README.md` 主体和根目录 `pyproject.toml` 来自上游。上游 README 仅新增本地说明链接。原来的本地 README 和 pyproject 已移至 `compat/sglang0518/`。
+`README.md` 主体和根目录 `pyproject.toml` 来自上游；本地增加了说明链接和 C++ kernel 打包规则。原来的本地 README 和 pyproject 已移至 `compat/sglang0518/`。模型目录的接口差异、来源及验证入口见 `sgl_amd_mono/qwen38_27b/README.md`。
 
 ## 现有实现的实际状态
 
@@ -34,13 +36,13 @@
 在仓库根目录执行：
 
 ```bash
-python -m pip install --no-deps --no-build-isolation -e compat/sglang0518
+python -m pip install --no-deps --no-build-isolation -e . -e compat/sglang0518
 python tools/source_status.py --verify
 python -m sgl_amd_mono_0518.cli contract
 git status --short
 ```
 
-上述安装使用当前分支里的兼容项目，不替换 Torch 或 SGLang。根目录上游包的安装要求见上游 README，不能把两种安装入口混用。
+上述安装使用当前分支里的模型包和旧版兼容项目，不替换 Torch 或 SGLang。只安装根项目仍不能在旧版 SGLang 中提供 hook 桥接；只安装兼容项目也不再包含计算实现。
 
 ```bash
 bash launch_qwen.sh
@@ -81,9 +83,9 @@ git rebase upstream/main
 解决冲突后，将 `UPSTREAM.lock.json` 的上游基线更新为此次实际使用的完整 SHA、日期和新的基线 tag；保留旧 tag。先审阅 `git diff <旧上游基线> <新上游基线> -- sgl_amd_mono`，核对 API、模型及 kernel 的变化，再运行：
 
 ```bash
-python -m pip install --no-deps --no-build-isolation -e compat/sglang0518
+python -m pip install --no-deps --no-build-isolation -e . -e compat/sglang0518
 python tools/source_status.py --verify
-python -m pytest -q test/unit/test_sglang0518_compat.py
+python -m pytest -q test/unit/test_qwen38_27b.py test/unit/test_sglang0518_compat.py
 python -m sgl_amd_mono_0518.cli contract
 ```
 

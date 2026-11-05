@@ -86,15 +86,15 @@ def after_initialize(result, runner):
         observed_forward_keys=[],
     )
     if Config.from_environment().mode == "fused_ffn":
-        from .ffn_runtime import FFNRuntime
+        from sgl_amd_mono.qwen38_27b.spec import build
 
-        _ffn_runtime = FFNRuntime(runner)
+        _ffn_runtime = build(runner, "fused_ffn")
         _process_report.update(_ffn_runtime.snapshot())
         _process_report["ffn_real_weight_validation"] = _ffn_runtime.validation
     elif Config.from_environment().mode in {"monokernel", "required"}:
-        from .mono_runtime import MonoRuntime
+        from sgl_amd_mono.qwen38_27b.spec import build
 
-        _mono_runtime = MonoRuntime(runner)
+        _mono_runtime = build(runner, Config.from_environment().mode)
         _process_report.update(_mono_runtime.snapshot())
     _save()
 

@@ -8,7 +8,7 @@ version = "0.1.0+gfx936.20261105"
 description = "gfx936 BF16 dense Qwen cooperative Monokernel integration for SGLang 0.5.18 DTK"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["sgl-amd-mono==0.1.0.dev0"]
 
 [project.entry-points."sglang.srt.plugins"]
 sgl_amd_mono_0518 = "sgl_amd_mono_0518.bootstrap:register"
@@ -20,4 +20,4 @@ sgl-amd-mono-0518 = "sgl_amd_mono_0518.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-sgl_amd_mono_0518 = ["manifest.json", "dense_monokernel.cpp"]
+sgl_amd_mono_0518 = ["manifest.json"]

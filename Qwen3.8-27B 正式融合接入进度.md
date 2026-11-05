@@ -6,11 +6,22 @@
 
 当前目录已改为真实 `sgl-project/sgl-amd-mono` Git 工作区，保留上游完整历史；上游 remote 为 `upstream`，基线为 `e52803f9d2b7dabff4bfd2f53ec25c03d56af947`，开发分支为 `local/sglang-0.5.18-gfx936`。迁移前代码有 `standalone-snapshot-20261105` tag 及完整 tar 备份。
 
-原先独立编写的代码统一收进 `compat/sglang0518/`。上游 `sgl_amd_mono/` 的 kernel 计算实现当前保持原样。逐项修改、安装和升级命令见根目录 `LOCAL_CHANGES.md`、`LOCAL_DEVELOPMENT.md`；通过 `git diff upstream-base-20261105..HEAD` 可以直接审阅所有本地差异。
+模型实现现统一维护在 `sgl_amd_mono/qwen38_27b/`，包含 spec、权重检查、gfx936 kernel、runner 和验证入口；`compat/sglang0518/` 保留旧版接口桥接及旧导入转发。原有上游模型与 common 的计算实现保持原样，新目录中的计算核心由此前本地实验迁入，尚未完成上游 BF16 stage 的移植。逐项修改、安装和升级命令见根目录 `LOCAL_CHANGES.md`、`LOCAL_DEVELOPMENT.md`；通过 `git diff upstream-base-20261105..HEAD` 可以审阅所有本地差异。
 
 **新增的 dense K1/K2 是自行编写的 DTK HIP 原型，尚未完成验收，不是上游 kernel 直接移植的成功结果。** 最近一次启动在 K2 真实权重检查中测得 NRMSE `0.0038988393`，超过 `0.003` 阈值；整模型试验也有超过原先 2% logits NRMSE 的样本。源码保留这些试验及其验收条件变更，默认严格模式拒绝启用该原型。性能测试仍未开始。
 
-下文保留此前 FFN 阶段记录；其中旧路径 `src/sgl_amd_mono_0518/` 现统一位于 `compat/sglang0518/src/sgl_amd_mono_0518/`，旧 wheel 和报告不代表最新 Git 分支的完整融合验收。
+下文保留此前 FFN 阶段记录；其中旧路径 `src/sgl_amd_mono_0518/` 的计算模块已迁至上述模型目录，旧 wheel 和报告不代表最新 Git 分支的完整融合验收。当前只通过旧版 HookRegistry 接入，未导出新版原生 `MonoSpec`。
+
+## 模型目录迁移验证（2026-11-05）
+
+- 本地模型与兼容层的 22 项 CPU 测试、4 项上游风格 SGLang 接口契约测试通过。
+- 原 dense C++ kernel 与 `source-managed-20261105` 逐字节一致；FFN kernel 的计算 AST 保持一致。
+- 新入口 `python -m sgl_amd_mono.qwen38_27b.check` 在 256/512 和真实 5120/17408 尺寸、batch 1/2 下完成 eager 与三次 Graph 重放，共 16 组检查，最大 NRMSE `0.0005089479 < 0.002`。
+- 服务通过根包 `sgl_amd_mono` 的插件入口接入旧版 hook；64 层真实权重共 128 组检查通过，最大 NRMSE `0.0013608205 < 0.002`。
+- 并发 1/2 的三项短生成请求各返回 8 token，均观察到 GPU FFN 执行计数增加；prefill-only 请求的融合执行增量为 0。
+- 根包 wheel 包含模型 Python 文件及 `gfx936/kernel.cpp`，隔离编译入口能从新包路径运行。
+
+结果保存在 `monokernel_reports/qwen38_27b/ffn-check.json`、`serving-check.json`、`refactor-verification.json`。这些验证说明模型目录与旧版接口接通，不作为完整 Monokernel 精度验收或性能对比。
 
 ## 此前 FFN 阶段记录
 
