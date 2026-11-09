@@ -12,6 +12,7 @@ dependencies = ["sgl-amd-mono==0.1.0.dev0"]
 
 [project.entry-points."sglang.srt.plugins"]
 sgl_amd_mono_0518 = "sgl_amd_mono_0518.bootstrap:register"
+sgl_amd_mono_flash_next_0518 = "sgl_amd_mono_0518.flash_next:register"
 
 [project.scripts]
 sgl-amd-mono-0518 = "sgl_amd_mono_0518.cli:main"

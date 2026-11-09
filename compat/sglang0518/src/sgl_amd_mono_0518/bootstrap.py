@@ -39,10 +39,30 @@ def before_resolve(server_args):
             raise ContractError(f"Dense fusion supports PP1 without additional execution features: {unsupported}")
         if int(os.environ.get("SGLANG_AMD_MONO_0518_SHADOW_STEPS", "0")) and getattr(server_args, "cuda_graph_backend_decode", None) != "disabled":
             raise ContractError("Model shadow validation requires --cuda-graph-backend-decode disabled")
-    server_args._mono_0518_checked = os.getpid()
+        if config.mode in {"monokernel", "required"} and not getattr(server_args, "disable_overlap_schedule", False):
+            raise ContractError("Cooperative Monokernel requires --disable-overlap-schedule while graph concurrency is unvalidated")
+        from sgl_amd_mono.qwen38_27b.gfx936.config import decode_model_enabled, full_attention_enabled
+
+        if config.mode == "required" and full_attention_enabled() and "full_attention_eager" not in report.get("accepted_features", []):
+            raise ContractError("Strict full attention fusion requires a matching full_attention_eager acceptance record")
+        if config.mode == "required" and decode_model_enabled() and "decode_model_eager" not in report.get("accepted_features", []):
+            raise ContractError("Strict complete decode fusion requires a matching decode_model_eager acceptance record")
+        if config.mode in {"monokernel", "required"} and getattr(server_args, "cuda_graph_backend_decode", None) != "disabled":
+            graph_accepted = "dense_graph" in report.get("accepted_features", [])
+            if full_attention_enabled():
+                graph_accepted = graph_accepted and "full_attention_graph" in report.get("accepted_features", [])
+            if decode_model_enabled():
+                graph_accepted = graph_accepted and "decode_model_graph" in report.get("accepted_features", [])
+            if config.mode == "required" and not graph_accepted:
+                raise ContractError("Strict Monokernel graph replay requires a matching dense_graph acceptance record")
+            if not graph_accepted and os.environ.get("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_GRAPH") != "1":
+                raise ContractError("Whole-model cooperative graph replay requires SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_GRAPH=1; use --cuda-graph-backend-decode disabled otherwise")
+            if os.environ.get("HIP_GRAPH_ACCUMULATE_DISPATCH") != "0":
+                raise ContractError("Cooperative graph capture requires HIP_GRAPH_ACCUMULATE_DISPATCH=0 before HIP initialization")
     if config.mode in {"monokernel", "required"}:
-        if os.environ.get("SGLANG_USE_AITER_LINEAR_ATTN") != "1":
-            raise ContractError("Dense Monokernel requires SGLANG_USE_AITER_LINEAR_ATTN=1 for matching FP32 GDN beta semantics")
+        for name in ("SGLANG_USE_LIGHTOP", "SGLANG_USE_CAUSAL_CONV1D", "SGLANG_USE_AITER_LINEAR_ATTN"):
+            if os.environ.get(name) != "1":
+                raise ContractError(f"Dense Monokernel requires {name}=1 to match the validated native numerical path")
         logger.warning("AMD_DENSE_MONO configuration eligible; awaiting all-layer real-weight validation before attachment")
     elif config.mode == "fused_ffn":
         logger.warning("AMD_FUSED_FFN configuration eligible; awaiting real-weight validation and decode routing; whole_model_monokernel=false")
@@ -52,6 +72,7 @@ def before_resolve(server_args):
             config.mode,
             "; ".join(report["disable_reasons"]),
         )
+    server_args._mono_0518_checked = os.getpid()
 
 
 def around_load_weights(original, model, weights, target_device):
@@ -121,7 +142,13 @@ def after_initialize(result, runner):
         try:
             if fused and _mono_runtime is not None and len(_mono_runtime.shadow_checks) < _mono_runtime.shadow_limit:
                 return _mono_runtime.shadow_forward(original, args, kwargs, batch)
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            if fused and _mono_runtime is not None:
+                import torch
+
+                if not torch.cuda.is_current_stream_capturing():
+                    _mono_runtime.check_synchronization()
+            return result
         finally:
             if runtime is not None:
                 runtime.enabled = previous
@@ -143,6 +170,12 @@ def after_internal_state(result, scheduler, request):
     return result
 
 
+def after_forward(result, runner, *args, **kwargs):
+    if _mono_runtime is not None and result.can_run_graph:
+        _mono_runtime.check_synchronization()
+    return result
+
+
 def register():
     global _registered
     if _registered or os.environ.get("SGLANG_AMD_MONO_0518", "0") == "0":
@@ -153,6 +186,7 @@ def register():
     HookRegistry.register(HOOK_TARGETS[1], around_load_weights, HookType.AROUND)
     HookRegistry.register(HOOK_TARGETS[2], after_initialize, HookType.AFTER)
     HookRegistry.register(HOOK_TARGETS[3], after_internal_state, HookType.AFTER)
+    HookRegistry.register(HOOK_TARGETS[4], after_forward, HookType.AFTER)
     _registered = True
 
 

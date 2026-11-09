@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "passed": true,
+  "qualified_at": "2026-11-05T13:26:46.845441+00:00",
+  "source_identity": {
+    "implementation_sha256": "9145803ee647264c89a5064fe19036c54e072a2253386626ce8f5749eb480895",
+    "compatibility_sha256": "405ebbb165c46ac6eae6ce78d53b496085458aa46e446977e06bc33b852f46c9",
+    "torch_version": "2.11.0+dtk2604.2609201441.gf74cd7",
+    "sglang_version": "0.5.18+dtk2604.torch2110.2609201917.g2b8d2b",
+    "hip_compiler_sha256": "9b2ddda4c2834cef7cfb282c9171e0184993e698020a8c4fb754dee862bbc909"
+  },
+  "features": [
+    "dense_eager",
+    "dense_graph",
+    "full_attention_eager",
+    "full_attention_graph",
+    "decode_model_eager",
+    "decode_model_graph"
+  ],
+  "git_head_at_validation": "f5c842b1db8a3c7ae332c8daee3c25ebdc4bdb73",
+  "git_worktree_uncommitted": true,
+  "implementation": "local DTK HIP full decode: embedding, 48 GDN K1, 16 full-attention K1, 64 K2, final norm and full BF16 LM head; legacy SGLang HookRegistry bridge",
+  "whole_model_monokernel": true,
+  "model_forward_modes": [
+    "decode"
+  ],
+  "validated_profile": {
+    "model_architecture": "Qwen3_5ForConditionalGeneration",
+    "gpu_arch": "gfx936",
+    "compute_units": 80,
+    "tp_size": 1,
+    "weight_dtype": "bfloat16",
+    "decode_rows": [
+      1,
+      2
+    ],
+    "kernel_launches_per_decode_forward": 129,
+    "disable_overlap_schedule": true,
+    "decode_graph_backends": [
+      "disabled",
+      "full"
+    ],
+    "attention_backend": "fa3",
+    "kv_cache_dtype": "fp8_e5m2",
+    "page_size": 64,
+    "context_length": 4096,
+    "mem_fraction_static": 0.9,
+    "largest_prompt_tokens": 2702,
+    "largest_output_tokens": 128,
+    "native_components": [
+      "prefill",
+      "sampling",
+      "scheduler_and_cache_state_tracking"
+    ]
+  },
+  "verification": {
+    "unit_tests": 76,
+    "sglang_source_hashes": 31,
+    "startup_real_weight_checks": 258,
+    "full_attention_checks": 324,
+    "attention_output_nrmse_max": 0.0,
+    "attention_rounding_inputs": 190458,
+    "attention_metadata_guard_checks": 22,
+    "decode_io_checks": 6,
+    "decode_io_graph_replays": 18,
+    "tail_nrmse_max": 0.0,
+    "barrier_fault_injection_checks": 8,
+    "full_decode_alternating_graph_checks": 16,
+    "same_state_shadow_forwards": 244,
+    "maximum_shadow_nrmse_per_request": 0.002074128030384282,
+    "minimum_shadow_cosine_per_request": 0.9999979138374329,
+    "maximum_shadow_kl_per_request": 1.7736592639039372e-08,
+    "maximum_same_input_kernel_nrmse": 0.0005638249301738663,
+    "maximum_active_state_nrmse": 0.0,
+    "same_state_argmax_equal": true,
+    "eager_exact_token_cases": 12,
+    "graph_exact_token_cases": 12,
+    "prefix_cached_tokens": 2688,
+    "prefix_matches_native_cold_and_warm": true,
+    "graph_transition_rounds": 4,
+    "eager_transition_rounds": 2,
+    "required_mode_without_opt_ins": true,
+    "strict_graph_exact_token_cases": 12,
+    "strict_graph_transition_rounds": 2,
+    "streaming_completion_tokens": 8
+  },
+  "evidence": [
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-attention-kernels.json",
+      "sha256": "04797ffcba9ba30a31ee23f7a19cd613c2cff0d1f4c5b9f8c91e81be12f4e3b4"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-decode-io.json",
+      "sha256": "e7925b2dec2a1170722ff7de64d3b65b8f6d2b2474d147c2977c8b788f3df3a7"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-rounding.json",
+      "sha256": "9cb0def168c801143fe6e7493210c66fd682da7a6b7342625ea70437488883db"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-guards.json",
+      "sha256": "cff49d3b2fdd1ddedb252be252dd222a352ef2eb931a255042518a74f1f4ef39"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-graph-chain.json",
+      "sha256": "99558f2e0381d9db51b4d58e9b232baa7b29ab70599a643e8f11a3f38a3fe11f"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-barrier.json",
+      "sha256": "8ecbe6b867b90398c5799ac2a4ee83eb2a77e8a62293424eec51382cbb401a63"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-shadow-suite.json",
+      "sha256": "c688d78eeee28ac797bc0949541f317c2dbbd50c75534fb01955061bb9cca7e9"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-long-shadow-suite.json",
+      "sha256": "857e655f46683fb13ac001cf695fc1a5467dc0b7f5b11476fa57de8201496604"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-shadow-validation.json",
+      "sha256": "8653e0c12826b5d940e47492e9892c76f161f8f229ab282b23e7fa790a16da71"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-eager-accepted-serving.json",
+      "sha256": "8d237d3ce64ab4f7c5954c2cbcbbaf2537e0ce2c87c3f4b04d46852514a2926a"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-graph-profile-match.json",
+      "sha256": "beb6ada58054981d4bec190c265de5f73a0666f45109e49d771c93ab6608e8ed"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-eager-transitions.json",
+      "sha256": "a211cabb6ccfce727d97f6b22e3b8df1e2ead794946bd7528259939fca1c7b81"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-graph-transitions.json",
+      "sha256": "67aefc424da991bfd9f0710ba1bd30c542d84231a5fd47fdcc5e77c40a59853d"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-native-reference-matrix.json",
+      "sha256": "5cc2d12002171404a08ea8a09fccb2fb42fdb37fbedf513c52e9fef235c343af"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/native-prefix-reference.json",
+      "sha256": "41edc7b18ddf86bd7023daf76f96462510bd9d405ad0177fa52a77f4e6048fc1"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-unit.log",
+      "sha256": "39fe0ece5d726ac7f3d4b311916024ef823f5da56179295f298925ba7c5ce328"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/final-source-status.json",
+      "sha256": "05e5ebed69e42bfe9735776bf8639fecfe67f2623c45774836253493f72938f6"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/complete-required-serving-verification.json",
+      "sha256": "2272ec907104a8c4e043c2cbb162f3509977e1973eaeaaef686f17303ee0e76c"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/complete-required-transitions.json",
+      "sha256": "5f05a2428a55193e7dec3ff031de32be06ef56a89b25158ff42c271cb74a54a4"
+    },
+    {
+      "path": "monokernel_reports/qwen38_27b/full_attention_20261105/complete-required-serving/launch.json",
+      "sha256": "c90e864b978ff9de2da5e5f0873a50adab4808feacb56308b8a5c109b3a6e015"
+    }
+  ]
+}

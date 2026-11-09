@@ -24,10 +24,10 @@
 
 - `audit`：走原生 SGLang，记录兼容契约与权重观察。
 - `fused_ffn`：此前验证过的 FFN 局部融合，仍不是完整 Monokernel。旧生成对照为 9/12 逐 token 一致，不能写成完整模型精度已通过。
-- `monokernel`：包含自行编写的 K1/K2 原型，**尚未完成整模型验收，默认拒绝启动**。仅设置 `SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1` 才允许继续实验，启动后仍执行真实权重检查。
-- `required`：严格模式始终拒绝当前未验收的原型，即使设置实验环境变量也不会放行。
+- `monokernel`：运行本地 DTK HIP decode 实现；接受源码及环境匹配的正式记录，未匹配时须显式实验 opt-in。启动后仍执行全部真实权重检查。
+- `required`：启动脚本的默认模式；只接受匹配的 `sgl_amd_mono/qwen38_27b/acceptance.json`。完整 decode 由六项 eager/Graph 能力自动启用，包括 embedding、48 层 GDN、16 层全注意力、64 层 K2、最终 norm 和 LM head，每步 129 次发射。实验开关不能绕过源码和环境准入。
 
-最新一次 dense 原型启动在 K2 检查中失败，测得 NRMSE `0.0038988393`，高于当时设置的 `0.003`。此前的整模型试验也曾超过 2% logits NRMSE。代码中尝试过基于 KL、cosine 和逐段误差的验收方式，但尚未据此完成通过的整模型验收；这些改动也保存在迁移快照中，不作为性能测试前提已满足的证明。
+迁移时的 dense 原型曾在 K2 检查中测得 NRMSE `0.0038988393`，整模型试验也曾超过 2% logits NRMSE。这些是保留在迁移快照中的历史失败，不代表当前实现。后续真实权重、同状态影子对照、Graph 和服务的最新结果统一记录在 `Qwen3.8-27B 正式融合接入进度.md`；验收记录绑定实际源码及环境，不依赖文档中的声明。
 
 现有 dense 原型的计算并非从上游 kernel 小修得来，见 `LOCAL_CHANGES.md`。Qwen 27B dense 参考代码属于 SGLang PR #43558，基线为 `b25e92f...`，不在此次 Monokernel main 的模型目录中；它的引用单独记录在锁文件中。
 
@@ -49,10 +49,10 @@ bash launch_qwen.sh
 bash launch_qwen_fused_ffn.sh
 ```
 
-实验性 dense 路径必须显式选择：
+修改源码后，尚未重新验收的开发路径须显式选择；测试完整 decode 时另设 `SGLANG_AMD_MONO_0518_DECODE_MODEL=1`：
 
 ```bash
-SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1 bash launch_qwen_monokernel.sh
+SGLANG_AMD_MONO_0518_MODE=monokernel SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1 bash launch_qwen_monokernel.sh
 ```
 
 该命令可能因数值检查失败而退出。它不代表已通过正式验收。
@@ -89,6 +89,6 @@ python -m pytest -q test/unit/test_qwen38_27b.py test/unit/test_sglang0518_compa
 python -m sgl_amd_mono_0518.cli contract
 ```
 
-升级源码不自动解除 gfx936、模型格式或 SGLang 接口限制。若更新 SGLang，须重新审查 `manifest.json` 固定的签名与文件 hash，并重新执行真实权重、状态和模型验证，不能只更新 hash。
+升级源码不自动解除 gfx936、模型格式或 SGLang 接口限制。若更新 SGLang，须重新审查 `manifest.json` 固定的签名与文件 hash，并重新执行真实权重、状态和模型验证，不能只更新 hash。模型源码、兼容源码、Torch/SGLang 版本或 HIP 编译器变化会使正式记录失配；必须重新完成验收后生成新记录，不能仅重算 `acceptance.json` 的指纹。
 
 升级通过后再提交锁文件和适配改动，并用 `git range-diff <旧基线>..<旧本地提交> <新基线>..HEAD` 审阅本地补丁是否被上游变化改变。无需升级时可切回原开发分支；中途冲突可用 `git rebase --abort` 返回升级前状态。

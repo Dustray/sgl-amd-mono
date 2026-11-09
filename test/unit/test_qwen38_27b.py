@@ -1,5 +1,6 @@
 import ast
 import builtins
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,161 @@ import sgl_amd_mono
 from sgl_amd_mono.qwen38_27b import spec
 from sgl_amd_mono.qwen38_27b.errors import UnsupportedConfiguration
 from sgl_amd_mono.qwen38_27b.gfx936 import config
+
+
+@pytest.fixture(autouse=True)
+def unaccepted_source_by_default(monkeypatch):
+    monkeypatch.setattr(config, "accepted_features", lambda: frozenset())
+
+
+@pytest.mark.parametrize("failure", [None, "implementation_sha256", "compatibility_sha256", "torch_version", "hip_compiler_sha256", "failed", "features", "malformed"])
+def test_acceptance_record_requires_exact_source_and_environment(tmp_path, monkeypatch, failure):
+    import json
+    from sgl_amd_mono.qwen38_27b import acceptance
+
+    identity = {name: "current" for name in ("implementation_sha256", "compatibility_sha256", "torch_version", "hip_compiler_sha256")}
+    record = {"schema_version": 1, "passed": True, "source_identity": dict(identity), "features": ["dense_eager", "dense_graph"]}
+    if failure in identity:
+        record["source_identity"][failure] = "stale"
+    elif failure == "failed":
+        record["passed"] = False
+    elif failure == "features":
+        record["features"] = ["dense_graph"]
+    elif failure == "malformed":
+        record = []
+    path = tmp_path / "acceptance.json"
+    path.write_text(json.dumps(record))
+    monkeypatch.setattr(acceptance, "RECORD_PATH", path)
+    monkeypatch.setattr(acceptance, "source_identity", lambda: identity)
+    assert acceptance.accepted_features() == (frozenset({"dense_eager", "dense_graph"}) if failure is None else frozenset())
+
+
+def test_strict_build_uses_current_accepted_runner(monkeypatch):
+    from sgl_amd_mono.qwen38_27b.gfx936 import runner
+
+    result = object()
+    monkeypatch.setattr(config, "accepted_features", lambda: frozenset({"dense_eager"}))
+    monkeypatch.setattr(runner, "MonoRuntime", lambda model_runner: result)
+    assert spec.build(None, "required") is result
+
+
+@pytest.fixture
+def shadow_check():
+    error = {"finite": True, "normalized_rms_error": 0.001, "cosine_similarity": 0.999999}
+    return {
+        "rows": 2,
+        "logits_per_row": [dict(error), dict(error)],
+        "kl_divergence_nats_per_row": [0.0001, 0.0001],
+        "state_checks": [{"conv": dict(error), "ssm": dict(error)} for _ in range(48)],
+        "local_checks": [{"layer": layer, "kernel": kind, "output": dict(error), **({"ssm_state": dict(error)} if kind == "K1" else {})} for layer in range(64) for kind in (("K2",) if layer % 4 == 3 else ("K1", "K2"))],
+    }
+
+
+def test_shadow_accepts_complete_checks(shadow_check):
+    from sgl_amd_mono.qwen38_27b.gfx936.check import shadow_accepted
+
+    assert shadow_accepted(shadow_check)
+
+
+@pytest.mark.parametrize("failure", [None, "missing_attention", "missing_tail", "missing_fp32", "bad_fp32", "bad_kv", "missing_precision", "bad_precision", "missing_native_fp32"])
+def test_complete_decode_shadow_requires_all_stages_and_independent_reference(shadow_check, failure):
+    from sgl_amd_mono.qwen38_27b.gfx936.check import shadow_accepted
+
+    error = dict(shadow_check["logits_per_row"][0])
+    shadow_check.update(full_attention_fused=True, complete_decode_model=True)
+    attention = [{"layer": layer, "kernel": "AttentionK1", "output": dict(error), "fp32_output": dict(error), "fa3_fp32_output": dict(error), "precision_output": dict(error), "key_cache": dict(error), "value_cache": dict(error)} for layer in range(3, 64, 4)]
+    shadow_check["local_checks"].extend(attention)
+    exact = {**error, "normalized_rms_error": 0.0}
+    shadow_check["local_checks"][0]["embedding"] = dict(exact)
+    shadow_check["local_checks"].append({"layer": 64, "kernel": "Tail", "output": dict(error), "normalized": dict(exact)})
+    if failure == "missing_attention":
+        shadow_check["local_checks"].remove(attention[0])
+    elif failure == "missing_tail":
+        shadow_check["local_checks"].pop()
+    elif failure == "missing_fp32":
+        attention[0].pop("fp32_output")
+    elif failure == "bad_fp32":
+        attention[0]["fp32_output"]["normalized_rms_error"] = 0.007
+    elif failure == "bad_kv":
+        attention[0]["value_cache"]["normalized_rms_error"] = 0.004
+    elif failure == "missing_precision":
+        attention[0].pop("precision_output")
+    elif failure == "bad_precision":
+        attention[0]["precision_output"]["normalized_rms_error"] = 0.004
+    elif failure == "missing_native_fp32":
+        attention[0].pop("fa3_fp32_output")
+    assert shadow_accepted(shadow_check) == (failure is None)
+
+
+def test_layer_snapshot_preserves_inputs_before_inplace_native_updates():
+    import torch
+    from sgl_amd_mono.qwen38_27b.gfx936.runner import MonoRuntime
+
+    runtime = object.__new__(MonoRuntime)
+    runtime.enabled = False
+    runtime.capture_shadow_inputs = True
+    runtime.shadow_phase = "native"
+    runtime.shadow_native_inputs = {}
+    runtime.shadow_native_outputs = {}
+    layer = SimpleNamespace(layer_id=3, o_proj=SimpleNamespace(forward=lambda hidden: (hidden * 2, None)))
+
+    def original(positions, hidden_states, forward_batch, residual, captured_last_layer_outputs):
+        hidden_states.add_(1)
+        projected, _ = layer.o_proj.forward(hidden_states)
+        residual.add_(2)
+        return projected, residual
+
+    hidden = torch.tensor([[1.0, 2.0]])
+    residual = torch.tensor([[3.0, 4.0]])
+    forward = runtime._wrap_layer(layer, original, None, None)
+    forward(None, hidden, None, residual)
+    captured = runtime.shadow_native_inputs[3]
+    assert torch.equal(captured["hidden"], torch.tensor([[1.0, 2.0]]))
+    assert torch.equal(captured["residual"], torch.tensor([[3.0, 4.0]]))
+    assert torch.equal(captured["core"], torch.tensor([[2.0, 3.0]]))
+    residual.zero_()
+    assert torch.equal(runtime.shadow_native_outputs[3][1], torch.tensor([[5.0, 6.0]]))
+
+
+def test_synchronization_failure_is_latched_and_rejects_partial_state(tmp_path, monkeypatch):
+    import json
+    import torch
+    from sgl_amd_mono.qwen38_27b.errors import ContractError
+    from sgl_amd_mono.qwen38_27b.gfx936 import runner
+
+    runtime = object.__new__(runner.MonoRuntime)
+    failure = torch.tensor(0, dtype=torch.int32)
+    runtime.synchronization_errors = [(5, "K1", failure), (5, "K2", torch.tensor(0, dtype=torch.int32))]
+    monkeypatch.setattr(runner, "report_directory", lambda: tmp_path)
+    runtime.check_synchronization()
+    failure.fill_(3)
+    for attempt in range(2):
+        with pytest.raises(ContractError, match="partially updated state"):
+            runtime.check_synchronization()
+    report = json.loads((tmp_path / "dense_synchronization_failure.json").read_text())
+    assert report["failures"] == [{"layer": 5, "kernel": "K1", "barrier_stage": 3}]
+    assert report["stateful_fallback_allowed"] is False
+
+
+@pytest.mark.parametrize("failure", ["one_request", "nonfinite_state", "missing_kernel", "duplicate_kernel", "empty_batch", "invalid_kl"])
+def test_shadow_rejects_partial_or_inaccurate_results(shadow_check, failure):
+    from sgl_amd_mono.qwen38_27b.gfx936.check import shadow_accepted
+
+    if failure == "one_request":
+        shadow_check["logits_per_row"][1]["normalized_rms_error"] = 0.025
+    elif failure == "nonfinite_state":
+        shadow_check["local_checks"][0]["ssm_state"]["finite"] = False
+    elif failure == "missing_kernel":
+        shadow_check["local_checks"].pop()
+    elif failure == "duplicate_kernel":
+        shadow_check["local_checks"][-1] = copy.deepcopy(shadow_check["local_checks"][0])
+    elif failure == "empty_batch":
+        shadow_check["rows"] = 0
+        shadow_check["logits_per_row"] = []
+        shadow_check["kl_divergence_nats_per_row"] = []
+    else:
+        shadow_check["kl_divergence_nats_per_row"][0] = float("nan")
+    assert not shadow_accepted(shadow_check)
 
 
 @pytest.fixture

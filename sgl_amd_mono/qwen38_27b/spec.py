@@ -45,8 +45,8 @@ def dense_disable_reasons(configuration, tp_size, device, expected_flydsl):
     expected_layers = list(geometry.LAYER_TYPES * (geometry.LAYERS // geometry.FULL_ATTENTION_INTERVAL))
     if text.get("layer_types", expected_layers) != expected_layers:
         reasons.append("Dense Monokernel requires three GDN layers followed by one full-attention layer")
-    if not geometry.experimental_dense_enabled():
-        reasons.append("The dense BF16 prototype has not passed acceptance; experimental runs require SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1")
+    if "dense_eager" not in geometry.accepted_features() and not geometry.experimental_dense_enabled():
+        reasons.append("Dense BF16 prototype has no matching source/environment acceptance record; experimental runs require SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE=1")
     return reasons
 
 
@@ -55,10 +55,10 @@ def build(runner, mode):
         from .gfx936.ffn_runner import FFNRuntime
 
         return FFNRuntime(runner)
-    if mode == "required":
+    if mode == "required" and "dense_eager" not in geometry.accepted_features():
         raise UnsupportedConfiguration("Strict Monokernel mode refuses the unaccepted dense BF16 prototype")
-    if mode == "monokernel":
-        if not geometry.experimental_dense_enabled():
+    if mode in {"required", "monokernel"}:
+        if "dense_eager" not in geometry.accepted_features() and not geometry.experimental_dense_enabled():
             raise UnsupportedConfiguration("Dense BF16 prototype requires explicit experimental opt-in")
         from .gfx936.runner import MonoRuntime
 

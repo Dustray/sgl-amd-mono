@@ -1,14 +1,20 @@
 # SGLang 0.5.18 兼容审计与 gfx936 BF16 FFN 融合插件
 
-本项目现已纳入真实 Monokernel 上游仓库的本地 Git 分支。源码基线、改动归属和升级命令见根目录 `LOCAL_DEVELOPMENT.md`、`LOCAL_CHANGES.md`、`UPSTREAM.lock.json`。本 README 中的历史验证记录仅针对相应旧实验；新增 dense K1/K2 原型尚未验收，默认禁止使用，不能据此称完整 Monokernel 已完成。
+本项目现已纳入真实 Monokernel 上游仓库的本地 Git 分支。源码基线、改动归属和升级命令见根目录 `LOCAL_DEVELOPMENT.md`、`LOCAL_CHANGES.md`、`UPSTREAM.lock.json`。本 README 的 FFN 验证记录保留为历史；当前 dense K1/K2 的支持范围和验收记录见 `sgl_amd_mono/qwen38_27b/README.md` 及根目录进度文档。`required` 仅接受源码和环境匹配的正式记录，不能用实验开关绕过。
 
 模型计算、权重检查及 GPU 验证现由根包 `sgl_amd_mono/qwen38_27b/` 维护。本目录保留旧版 SGLang 的 hook、契约与启动入口；旧计算模块仅转发到根包。安装时需要同时安装下面两个项目。
 
-当前包包含兼容审计模式和实验性 `fused_ffn` 模式。后者通过真实 FlyDSL kernel 融合 Qwen3.8-27B 的 BF16 dense FFN，每层使用两次 GPU launch，覆盖 decode batch 1/2。**GDN、全注意力、residual 和 norm 继续使用 SGLang；完整模型 Monokernel 尚未完成，尚无加速结论。**
+当前包保留兼容审计及历史 `fused_ffn` 模式，同时桥接模型目录中的 decode 实现。历史 FFN 模式每层使用两次 GPU launch；原 dense 配置每步 112 次 launch。完整 decode 配置现覆盖 16 个 attention K1、embedding 加首层 GDN K1、其余 GDN K1、全部 K2，以及 norm/LM head Tail，共 129 次发射。固定源码和环境的六项 eager/Graph 能力已写入模型目录的 `acceptance.json`，`required` 自动启用完整路径。prefill、采样及调度/状态管理沿用原生实现；具体精度、服务证据和配置边界见根目录进度文档。2026-11-06 已完成同卡 18 组性能对照，当前 Monokernel 端到端耗时为原生的 2.89–12.10 倍；结果见根目录 `Qwen3.8-27B 原生与Monokernel性能对比.md`。
 
 当前硬件是海光 `gfx936`，模型是 `Qwen3_5ForConditionalGeneration` / `qwen3_5`、BF16、64 层、TP1。文档固定的上游版本只覆盖 gfx950 / DeepSeek-V4.1-Flash。核对的上游主分支虽有 Qwen kernel，但对应 `Qwen4ExpForConditionalGeneration`、gfx950、Quark MXFP4/FP8、48 层及 NEXTN verify，不覆盖这里的 Qwen3.8-27B。
 
-已另行核对上游 SGLang PR #43558 的 27B dense kernel：模型尺寸吻合，但仅接收 Quark MXFP4、要求 gfx950 和至少 256 CU；当前 BF16 / gfx936 / 80 CU 不能直接运行。DTK 版 FlyDSL 已安装，BF16 MMAC、SiLU-mul 和 HIP Graph 基础验证通过。详细记录见 `Qwen3.8-27B 正式融合接入进度.md`。按用户要求，真实性能对比等待正式融合及模型数值验证完成后再进行。
+已另行核对上游 SGLang PR #43558 的 27B dense kernel：模型尺寸吻合，但仅接收 Quark MXFP4、要求 gfx950 和至少 256 CU；当前 BF16 / gfx936 / 80 CU 不能直接运行。DTK 版 FlyDSL 已安装，BF16 MMAC、SiLU-mul 和 HIP Graph 基础验证通过。详细记录见 `Qwen3.8-27B 正式融合接入进度.md`。正式融合和模型数值验收完成后，已于 2026-11-06 开展并完成真实性能对比。
+
+## Flash-Next TP8 / gfx936
+
+Flash-Next BF16 的新增计算实现位于 `sgl_amd_mono/qwen38_flash_next/gfx936/`，适配入口为 `sgl_amd_mono_0518.flash_next:register`。设置 `SGLANG_AMD_FLASH_NEXT_0518=1` 启用，与 dense 27B 插件互斥。使用 `bash launch_qwen_flash_next_monokernel.sh --max-running-requests 2` 启动。
+
+普通 decode 的数学计算覆盖 embedding 到全词表 logits，每卡每步 99 次融合发射；prefill、采样和调度/状态元数据由 SGLang 执行。当前限制为 BF16、TP8、gfx936、batch 1/2、context ≤ 4096、page64，关闭服务 Graph、overlap、radix cache 和 PLE embedding offload。MTP / NEXTN verify 尚未接入。完整实现、验收结果和升级要求见根目录 `Qwen3.8-Flash-Next TP8 gfx936 Monokernel 接入进度.md`。
 
 ## 安装
 
@@ -17,7 +23,7 @@ python -m pip install --no-deps --no-build-isolation -e . -e compat/sglang0518
 python -m pip wheel --no-deps --no-build-isolation -w dist . compat/sglang0518
 ```
 
-上述命令在仓库根目录执行。插件以 `sglang.srt.plugins` entry point 自动发现。未设置 `SGLANG_AMD_MONO_0518=1` 时不注册 hook。安装和运行均不修改 `site-packages/sglang` 文件；manifest 固定当前 DTK 下游 wheel 的版本及 21 个关键源码文件 SHA256，并核对四个 hook 目标的签名。
+上述命令在仓库根目录执行。插件以 `sglang.srt.plugins` entry point 自动发现。未设置 `SGLANG_AMD_MONO_0518=1` 时不注册 hook。安装和运行均不修改 `site-packages/sglang` 文件；manifest 固定当前 DTK 下游 wheel 的版本及 31 个关键源码文件 SHA256，并核对五个 hook 目标的签名。新增的 ModelRunner 返回 hook 在 Graph 解码后检查设备同步错误，发生错误时拒绝已部分更新的状态。
 
 ### 当前 Python 3.10 环境的 FlyDSL
 
@@ -75,7 +81,7 @@ sgl-amd-mono-0518 preflight \
 bash launch_qwen_monokernel.sh
 ```
 
-后两个命令在当前组合上必须失败。拒绝发生在权重加载前；报告列出硬件、模型、TP、框架 API 和缺少可执行 spec 等原因，并记录当前 FlyDSL 版本。通用插件加载器会捕获注册错误，因此专用 launcher 还检查 hook 是否真正安装。
+缺少匹配的正式验收记录时，后两个命令在权重加载前拒绝运行；源码和环境匹配时继续检查模型、硬件、TP 及全部真实权重。通用插件加载器会捕获注册错误，因此专用 launcher 还检查五个 hook 是否真正安装。
 
 ## 审计模式运行 Qwen
 
@@ -83,7 +89,7 @@ bash launch_qwen_monokernel.sh
 SGLANG_AMD_MONO_0518_MODE=audit bash launch_qwen_monokernel.sh
 ```
 
-审计模式明确保留 SGLang 原始计算路径，记录 `execution_path=sglang_original`、`monokernel_eligible=false` 和 `monokernel_executions=0`。它用于证明插件注册、权重观察、ModelRunner 接入以及 prefill/decode 路由可用，不用于验证 Monokernel 性能。
+审计模式明确保留 SGLang 原始计算路径，记录 `execution_path=sglang_original` 和 `monokernel_executions=0`。`monokernel_eligible` 独立反映模型、设备和验收条件是否满足，不表示实际启用了融合。审计用于检查插件注册、权重观察、ModelRunner 接入及路由，不用于验证 Monokernel 性能。
 
 ```bash
 sgl-amd-mono-0518 status
@@ -110,7 +116,7 @@ kill "$(cat qwen3.8-27b-monokernel.pid)"
 
 ```bash
 bash launch_qwen.sh
-SGLANG_AMD_MONO_0518=0 bash launch_qwen_monokernel.sh
+SGLANG_AMD_MONO_0518=0 bash launch_qwen.sh
 ```
 
 ## 尚缺的工作

@@ -13,6 +13,7 @@ HOOK_TARGETS = (
     "sglang.srt.model_loader.loader.DefaultModelLoader.load_weights_and_postprocess",
     "sglang.srt.model_executor.model_runner.ModelRunner.initialize",
     "sglang.srt.managers.scheduler.Scheduler.get_internal_state",
+    "sglang.srt.model_executor.model_runner.ModelRunner.forward",
 )
 
 
@@ -52,6 +53,7 @@ def environment_contract():
             True,
         ),
         ("srt/model_executor/model_runner.py", "ModelRunner", "initialize", ("self",), False),
+        ("srt/model_executor/model_runner.py", "ModelRunner", "forward", ("self", "forward_batch", "skip_attn_backend_init", "pp_proxy_tensors", "reinit_attn_backend", "split_forward_count"), False),
         ("srt/managers/scheduler.py", "Scheduler", "get_internal_state", ("self", "recv_req"), False),
     )
     for relative, class_name, method_name, arguments, is_static in contracts:
@@ -143,6 +145,7 @@ def probe(model_path, tp_size=1, device=None):
     if not any(spec.get("name") == "gfx936_bf16_dense_qwen" for spec in specs):
         mono_reasons.append("Dense BF16 Monokernel spec is missing")
     experimental_dense = os.environ.get("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE") == "1"
+    accepted_features = model_spec.geometry.accepted_features()
     return {
         "contract": contract,
         "device": device,
@@ -160,7 +163,8 @@ def probe(model_path, tp_size=1, device=None):
         "upstream": upstream,
         "model_implementation": "sgl_amd_mono.qwen38_27b",
         "monokernel_eligible": not mono_reasons,
-        "monokernel_acceptance": "not_accepted_experimental",
+        "monokernel_acceptance": "accepted" if "dense_eager" in accepted_features else "not_accepted_experimental",
+        "accepted_features": sorted(accepted_features),
         "experimental_dense_opt_in": experimental_dense,
         "disable_reasons": mono_reasons,
         "documented_upstream_disable_reasons": reasons,

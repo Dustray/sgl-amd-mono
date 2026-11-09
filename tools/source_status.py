@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 from importlib import metadata, util
 import json
 from pathlib import Path
@@ -74,6 +75,14 @@ def main():
             report["errors"].append("Model distribution metadata is missing; install the root project")
     if arguments.require_clean and status:
         report["errors"].append("Working tree has uncommitted or untracked changes")
+    from sgl_amd_mono.qwen38_flash_next.gfx936.contract import validate_sources
+
+    flash_directory = ROOT / "sgl_amd_mono" / "qwen38_flash_next" / "gfx936"
+    try:
+        flash_contract = validate_sources()
+        report["flash_next_gfx936"] = {"source_directory": str(flash_directory), "source_sha256": {source.name: hashlib.sha256(source.read_bytes()).hexdigest() for source in sorted(flash_directory.iterdir()) if source.suffix in (".py", ".cpp", ".json")}, "native_source_files_checked": len(flash_contract["sglang_source_sha256"]), "versions": flash_contract["versions"], "entrypoint": "sgl_amd_mono_0518.flash_next:register"}
+    except RuntimeError as error:
+        report["errors"].append(f"Flash-Next gfx936 source contract: {error}")
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return int(arguments.verify and bool(report["errors"]))
 

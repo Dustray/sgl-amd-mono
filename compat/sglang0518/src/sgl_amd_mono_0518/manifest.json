@@ -1,6 +1,16 @@
 {
   "sglang_version": "0.5.18+dtk2604.torch2110.2609201917.g2b8d2b",
   "sglang_files": {
+    "srt/layers/logits_processor.py": "179fc52d2a6e72ae263914770d262d4e3739ad05836a0dd37d0394fd630eb243",
+    "srt/models/qwen3_vl.py": "3e8118cede784278d6dd1e755588b506974431df2ea17fa1c9e1d1a5e34fd4c1",
+    "srt/layers/vocab_parallel_embedding.py": "c837114a550d4d5b337e3e14847eb0b72896c45a124b57f2364272e8cb4a0113",
+    "srt/models/utils.py": "192886eac1fafcd0fdc6cd69af40515d5625edea8df67a94715e7c738c7c4f03",
+    "srt/layers/attention/flashattention_backend.py": "cb3ac7b88944d3c65523f9702ba9eaa253622b898c4d9604062d112c2c2591b3",
+    "srt/layers/attention/flashattention_interface.py": "f5459609055b2cefb7eeb348a419d243aed0d59bc7cf45606ed6106ca8c49c26",
+    "srt/layers/rotary_embedding/mrope.py": "7e16f073fa9016df2e67f3fe0b34a30cbe01a017e8dbf81210a8c12b328ee6f2",
+    "srt/layers/rotary_embedding/utils.py": "828a50285218e40c3429d2f4e75b1d051e3a89d831a7ab005e8c2609278aeddc",
+    "kernels/ops/attention/rotary_triton.py": "49b3a2ca2784b4ffb0773947d2e26055f55a520c9cd847b86bcc3f6c2bf94d05",
+    "kernels/ops/elementwise/elementwise.py": "2592f87a688dc86f217e5e35bc88ba4c49639d5e3b52b3a4132126329f079ced",
     "srt/plugins/__init__.py": "3a975a73f1a7887e68c81ea7a2530250597ac8ae978efc0b0f70f038a99a3164",
     "srt/plugins/hook_registry.py": "fe214acac324cb2f019aa1dffe1ddcb6e4691862fdd1b6a0ad5033d8167e31e9",
     "srt/server_args.py": "50a7b9f5f61392348fb5d77208f99cbe2a2868f305d4097e25bbb530c6e04f81",
@@ -65,7 +75,7 @@
   "bundled_monokernel_specs": [
     {
       "name": "gfx936_bf16_dense_qwen",
-      "status": "experimental_unaccepted",
+      "status": "requires_matching_acceptance_record_or_experimental_opt_in",
       "implementation": "DTK HIP cooperative K1/K2",
       "gpu_arch": "gfx936",
       "persistent_blocks": 80,
@@ -78,7 +88,8 @@
       "k2_layers": 64,
       "kernels_per_decode_forward": 112,
       "native_components": ["full-attention QKV/RoPE/FA3/gate", "final norm", "embedding", "LM head", "prefill", "mamba prefix-state tracking"],
-      "activation": "startup requires all-layer real-weight numerical validation"
+      "activation": "startup requires all-layer real-weight numerical validation",
+      "synchronization": "device atomic epoch barrier; one-second deadline; failure latched and checked before sampling"
     }
   ],
   "experimental_fusions": [

@@ -1,6 +1,8 @@
 from pathlib import Path
 import os
 
+from ..acceptance import accepted_features
+
 
 ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 MODEL_TYPE = "qwen3_5"
@@ -28,6 +30,14 @@ STATE_DIMENSIONS = {
 
 def experimental_dense_enabled():
     return os.environ.get("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_DENSE") == "1"
+
+
+def full_attention_enabled():
+    return "full_attention_eager" in accepted_features() or os.environ.get("SGLANG_AMD_MONO_0518_FULL_ATTENTION") == "1" or decode_model_enabled()
+
+
+def decode_model_enabled():
+    return "decode_model_eager" in accepted_features() or os.environ.get("SGLANG_AMD_MONO_0518_DECODE_MODEL") == "1"
 
 
 def report_directory():

@@ -8,10 +8,29 @@ import torch
 from safetensors import safe_open
 
 os.environ.setdefault("SGLANG_USE_AITER_LINEAR_ATTN", "1")
+os.environ.setdefault("HIP_GRAPH_ACCUMULATE_DISPATCH", "0")
 
 from sgl_amd_mono.qwen38_27b.gfx936.program import DenseK1, DenseK2
 from sgl_amd_mono.qwen38_27b.gfx936.ffn import numerical_error
 from sgl_amd_mono.qwen38_27b.gfx936.check import native_k1, native_k2
+
+
+def active_row_error(actual, expected, indices):
+    active = indices >= 0
+    if bool(active.any()):
+        return numerical_error(actual[active], expected[active])
+    return numerical_error(torch.zeros_like(actual), torch.zeros_like(actual))
+
+
+def k1_check(actual, actual_residual, expected, expected_residual, conv_state, reference_conv, ssm_state, reference_ssm, indices):
+    return {
+        "output": active_row_error(actual, expected, indices),
+        "residual": numerical_error(actual_residual, expected_residual),
+        "conv_state": numerical_error(conv_state, reference_conv),
+        "ssm_state": numerical_error(ssm_state, reference_ssm),
+        "active_rows": int((indices >= 0).sum()),
+        "inactive_output_zero": bool((actual[indices < 0] == 0).all()),
+    }
 
 
 def main():
@@ -53,7 +72,7 @@ def main():
                 for step in range(5):
                     actual, actual_residual = kernel1(hidden, residual if step else None, conv_state, ssm_state, indices)
                     expected, expected_residual, intermediates = native_k1(kernel1, hidden, residual if step else None, reference_conv, reference_ssm, indices)
-                    check = {"kernel": "K1", "layer": layer_index, "rows": rows, "step": step, "output": numerical_error(actual, expected), "residual": numerical_error(actual_residual, expected_residual), "conv_state": numerical_error(conv_state, reference_conv), "ssm_state": numerical_error(ssm_state, reference_ssm), "intermediates": {name: numerical_error(getattr(kernel1, name)[:rows], tensor) for name, tensor in intermediates.items()}}
+                    check = {"kernel": "K1", "layer": layer_index, "rows": rows, "step": step, **k1_check(actual, actual_residual, expected, expected_residual, conv_state, reference_conv, ssm_state, reference_ssm, indices), "intermediates": {name: active_row_error(getattr(kernel1, name)[:rows], tensor, indices) if name == "convolved" else numerical_error(getattr(kernel1, name)[:rows], tensor) for name, tensor in intermediates.items()}}
                     report["checks"].append(check)
                     print(json.dumps(check), flush=True)
                     hidden.add_(0.03125)
@@ -70,7 +89,7 @@ def main():
                     indices.copy_(torch.tensor(([-1, 2] if step == 4 else ([3, 2] if step % 2 else [1, 3]))[:rows], device="cuda", dtype=indices.dtype))
                     graph1.replay()
                     expected, expected_residual, _ = native_k1(kernel1, hidden, residual, reference_conv, reference_ssm, indices)
-                    check = {"kernel": "K1", "mode": "graph", "layer": layer_index, "rows": rows, "step": step, "output": numerical_error(graph_output1, expected), "residual": numerical_error(graph_residual1, expected_residual), "conv_state": numerical_error(conv_state, reference_conv), "ssm_state": numerical_error(ssm_state, reference_ssm)}
+                    check = {"kernel": "K1", "mode": "graph", "layer": layer_index, "rows": rows, "step": step, **k1_check(graph_output1, graph_residual1, expected, expected_residual, conv_state, reference_conv, ssm_state, reference_ssm, indices)}
                     report["checks"].append(check)
                     print(json.dumps(check), flush=True)
                 assert int(kernel1.executions.item()) - before == 5
@@ -100,7 +119,7 @@ def main():
         del kernel1, kernel2, gate_up
         gc.collect()
         torch.cuda.empty_cache()
-    report["passed"] = all(check["output"]["finite"] and check["output"]["normalized_rms_error"] < 0.003 and check["residual"]["finite"] and check["residual"]["normalized_rms_error"] < 0.002 and check.get("ssm_state", {"normalized_rms_error": 0})["normalized_rms_error"] < 0.003 and check.get("conv_state", {"normalized_rms_error": 0})["normalized_rms_error"] < 0.002 for check in report["checks"])
+    report["passed"] = all(check["output"]["finite"] and check["output"]["normalized_rms_error"] < 0.003 and check["residual"]["finite"] and check["residual"]["normalized_rms_error"] < 0.002 and check.get("ssm_state", {"normalized_rms_error": 0})["normalized_rms_error"] < 0.003 and check.get("conv_state", {"normalized_rms_error": 0})["normalized_rms_error"] < 0.002 and check.get("inactive_output_zero", True) for check in report["checks"])
     arguments.output.write_text(json.dumps(report, indent=2) + "\n")
     if not report["passed"]:
         raise RuntimeError(f"Dense Monokernel verification failed: {arguments.output}")

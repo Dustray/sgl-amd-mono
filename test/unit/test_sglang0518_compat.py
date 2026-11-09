@@ -1,9 +1,91 @@
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from sgl_amd_mono_0518 import contract
+
+
+@pytest.fixture(autouse=True)
+def unaccepted_source_by_default(monkeypatch):
+    monkeypatch.setattr(contract.model_spec.geometry, "accepted_features", lambda: frozenset())
+    monkeypatch.setenv("SGLANG_USE_LIGHTOP", "1")
+    monkeypatch.setenv("SGLANG_USE_CAUSAL_CONV1D", "1")
+
+
+def test_graph_replay_cannot_bypass_device_failure_check(monkeypatch):
+    from sgl_amd_mono_0518 import bootstrap
+
+    def reject():
+        raise contract.ContractError("persistent device failure")
+
+    monkeypatch.setattr(bootstrap, "_mono_runtime", SimpleNamespace(enabled=False, check_synchronization=reject))
+    with pytest.raises(contract.ContractError, match="persistent device failure"):
+        bootstrap.after_forward(SimpleNamespace(can_run_graph=True), None)
+    result = SimpleNamespace(can_run_graph=False)
+    assert bootstrap.after_forward(result, None) is result
+
+
+@pytest.mark.parametrize("missing", ["SGLANG_USE_LIGHTOP", "SGLANG_USE_CAUSAL_CONV1D", "SGLANG_USE_AITER_LINEAR_ATTN"])
+def test_dense_refuses_unvalidated_native_numerical_path(monkeypatch, missing):
+    from sgl_amd_mono_0518 import bootstrap
+
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_MODE", "required")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_SHADOW_STEPS", "0")
+    for name in ("SGLANG_USE_LIGHTOP", "SGLANG_USE_CAUSAL_CONV1D", "SGLANG_USE_AITER_LINEAR_ATTN"):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.delenv(missing)
+    monkeypatch.setattr(bootstrap, "probe", lambda *args: {"accepted_features": ["dense_eager"]})
+    monkeypatch.setattr(bootstrap, "validate", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "_save", lambda: None)
+    arguments = SimpleNamespace(model_path="unused", tp_size=1, pp_size=1, disable_overlap_schedule=True, cuda_graph_backend_decode="disabled")
+    with pytest.raises(contract.ContractError, match=missing):
+        bootstrap.before_resolve(arguments)
+    assert not hasattr(arguments, "_mono_0518_checked")
+    monkeypatch.setenv(missing, "1")
+    bootstrap.before_resolve(arguments)
+
+
+@pytest.mark.parametrize("overlap_disabled,graph_backend", [(False, "disabled"), (True, "full")])
+def test_dense_refuses_unvalidated_scheduling(monkeypatch, overlap_disabled, graph_backend):
+    from sgl_amd_mono_0518 import bootstrap
+
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_MODE", "monokernel")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_SHADOW_STEPS", "0")
+    monkeypatch.delenv("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_GRAPH", raising=False)
+    monkeypatch.setattr(bootstrap, "probe", lambda *arguments: {})
+    monkeypatch.setattr(bootstrap, "validate", lambda *arguments: None)
+    monkeypatch.setattr(bootstrap, "_save", lambda: None)
+    arguments = SimpleNamespace(model_path="unused", tp_size=1, pp_size=1, disable_overlap_schedule=overlap_disabled, cuda_graph_backend_decode=graph_backend)
+    with pytest.raises(contract.ContractError, match="overlap|graph replay"):
+        bootstrap.before_resolve(arguments)
+
+
+@pytest.mark.parametrize("accumulation", [None, "1", "0"])
+def test_cooperative_graph_requires_runtime_configuration(monkeypatch, accumulation):
+    from sgl_amd_mono_0518 import bootstrap
+
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_MODE", "monokernel")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_SHADOW_STEPS", "0")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_GRAPH", "1")
+    monkeypatch.setenv("SGLANG_USE_AITER_LINEAR_ATTN", "1")
+    if accumulation is None:
+        monkeypatch.delenv("HIP_GRAPH_ACCUMULATE_DISPATCH", raising=False)
+    else:
+        monkeypatch.setenv("HIP_GRAPH_ACCUMULATE_DISPATCH", accumulation)
+    monkeypatch.setattr(bootstrap, "probe", lambda *arguments: {})
+    monkeypatch.setattr(bootstrap, "validate", lambda *arguments: None)
+    monkeypatch.setattr(bootstrap, "_save", lambda: None)
+    arguments = SimpleNamespace(model_path="unused", tp_size=1, pp_size=1, disable_overlap_schedule=True, cuda_graph_backend_decode="full")
+    if accumulation == "0":
+        bootstrap.before_resolve(arguments)
+    else:
+        with pytest.raises(contract.ContractError, match="HIP_GRAPH_ACCUMULATE_DISPATCH"):
+            bootstrap.before_resolve(arguments)
 
 
 @pytest.fixture
@@ -69,6 +151,30 @@ def test_explicit_experiment_does_not_claim_acceptance(model_path, device, monke
     assert report["monokernel_eligible"]
     assert report["monokernel_acceptance"] == "not_accepted_experimental"
     contract.validate(report, "monokernel")
+
+
+def test_matching_record_enables_strict_eager_without_experimental_opt_in(model_path, device, monkeypatch):
+    monkeypatch.setattr(contract.model_spec.geometry, "accepted_features", lambda: frozenset({"dense_eager"}))
+    report = contract.probe(model_path, device=device)
+    assert report["monokernel_eligible"]
+    assert report["monokernel_acceptance"] == "accepted"
+    assert not report["experimental_dense_opt_in"]
+    contract.validate(report, "required")
+
+
+def test_strict_eager_record_cannot_enable_unaccepted_graph(monkeypatch):
+    from sgl_amd_mono_0518 import bootstrap
+
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_MODE", "required")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_ALLOW_EXPERIMENTAL_GRAPH", "1")
+    monkeypatch.setenv("SGLANG_AMD_MONO_0518_SHADOW_STEPS", "0")
+    monkeypatch.setattr(bootstrap, "probe", lambda *args: {"accepted_features": ["dense_eager"]})
+    monkeypatch.setattr(bootstrap, "validate", lambda *args: None)
+    monkeypatch.setattr(bootstrap, "_save", lambda: None)
+    arguments = SimpleNamespace(model_path="unused", tp_size=1, pp_size=1, disable_overlap_schedule=True, cuda_graph_backend_decode="full")
+    with pytest.raises(contract.ContractError, match="dense_graph acceptance record"):
+        bootstrap.before_resolve(arguments)
 
 
 @pytest.mark.parametrize("changes", [{"gpu_arch": "gfx950"}, {"gpu_compute_units": 79}])

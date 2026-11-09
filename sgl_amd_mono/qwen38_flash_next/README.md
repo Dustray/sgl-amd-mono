@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next monokernel on gfx950
 
+> 本地 BF16 / TP8 / gfx936 实现位于 [gfx936/](gfx936/README.md)，使用 SGLang 0.5.18 兼容插件。本文其余部分描述原有 gfx950 / Quark / TP1 / NEXTN 实现。
+
 This document explains the monokernel in `sgl_amd_mono/qwen38_flash_next/`: what the target verify and MTP draft
 launches do, stage by stage, and how they plug into SGLang. File and symbol names refer to this repository; the SGLang
 interface is the one of RFC sgl-project/sglang#43949.

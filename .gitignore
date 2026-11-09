@@ -6,6 +6,7 @@ dist/
 .ruff_cache/
 /.upstream-source-staging/
 /monokernel_reports/
+/profiles/
 /benchmark_results/
 /*.log
 /*.pid
