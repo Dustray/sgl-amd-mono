@@ -13,3 +13,5 @@ dist/
 /monokernel_contract.json
 /monokernel_serving_verification.json
 /core*
+/bench_results/
+/archive/runtime/

@@ -13,6 +13,7 @@ import time
 import aiohttp
 import requests
 
+from sgl_amd_mono.common.gpus import check_gpus_idle
 from sgl_amd_mono.common.profile_trace import merge_profiles
 
 
@@ -164,6 +165,72 @@ def capture(arguments, mode, directory, url, inputs):
     return summary
 
 
+def stop_under_hipprof(server, port):
+    """hipprof writes the trace when the process it wraps exits, so signal the traced server itself:
+    a signal to hipprof would kill the exporter before it runs."""
+    traced = [int(path.name) for path in Path("/proc").iterdir() if path.name.isdigit()
+              and b"sglang.launch_server" in (path / "cmdline").read_bytes() if f"--port\x00{port}".encode() in (path / "cmdline").read_bytes()]
+    if not traced:
+        print("no traced sglang process found; signalling the hipprof group instead", flush=True)
+        os.killpg(server.pid, signal.SIGTERM)
+    for pid in traced:
+        os.kill(pid, signal.SIGTERM)
+    print(f"stopped the server ({traced}); hipprof is exporting its trace, this can take minutes", flush=True)
+    try:
+        server.wait(timeout=3600)
+    except subprocess.TimeoutExpired:
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait(timeout=60)
+        raise RuntimeError("hipprof did not finish exporting within an hour")
+
+
+def hipprof_control(session, instruction):
+    command = ["hipprof", "--session-client", session, instruction]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    if result.returncode:
+        raise RuntimeError(f"{' '.join(command)} failed: {result.stdout}{result.stderr}")
+    return result.stdout.strip()
+
+
+def hipprof_capture(arguments, mode, directory, url, inputs, session):
+    """Trace only the measured request: the server runs under `hipprof --trace-off`, and the
+    session client turns tracing on around this one generate call."""
+    for iteration in range(arguments.warmup):
+        request_json(url, "/flush_cache", {})
+        asyncio.run(generate_batch(url, inputs, 4))
+        print(f"{mode}: warmup {iteration + 1}/{arguments.warmup} complete", flush=True)
+    request_json(url, "/flush_cache", {})
+    before = request_json(url, "/server_info")
+    if (mode == "monokernel") != bool(shadow_state(before)):
+        raise RuntimeError("Live server route does not match the requested profiling mode")
+    save(directory / "capture.json", {"mode": mode, "tool": "hipprof", "session": session, "inputs": inputs,
+                                      "output_tokens": arguments.output_tokens, "server_info_before": before, "profile_is_accuracy_acceptance": False})
+    hipprof_control(session, "--start")
+    try:
+        print(f"{mode}: hipprof tracing {arguments.input_tokens}->{arguments.output_tokens}, batch {arguments.batch_size}", flush=True)
+        results = asyncio.run(generate_batch(url, inputs, arguments.output_tokens))
+    finally:
+        hipprof_control(session, "--stop")
+        hipprof_control(session, "--flush")
+    save(directory / "requests.json", [result for result, _ in results])
+    after = request_json(url, "/server_info")
+    save(directory / "server_info_after.json", after)
+    before_shadow, after_shadow = shadow_state(before), shadow_state(after)
+    if [(state["shadow_checks"], state["full_model_shadow_checks"]) for state in before_shadow] != [(state["shadow_checks"], state["full_model_shadow_checks"]) for state in after_shadow]:
+        raise RuntimeError("Accuracy shadow work contaminated the traced request")
+    steps = None
+    if mode == "monokernel":
+        steps = after_shadow[0]["completed_decode_steps"] - before_shadow[0]["completed_decode_steps"]
+        if steps != arguments.output_tokens - 1:
+            raise RuntimeError(f"Traced request ran {steps} fused decode steps, expected {arguments.output_tokens - 1}")
+    summary = {"tool": "hipprof", "mode": mode, "prompt_tokens": arguments.input_tokens, "output_tokens": arguments.output_tokens,
+               "batch_size": arguments.batch_size, "mono_decode_steps": steps, "shadow_state_before": before_shadow,
+               "shadow_state_after": after_shadow, "profile_is_accuracy_acceptance": False,
+               "client": {key: results[0][0][key] for key in ("e2e_s", "ttft_s", "decode_s")}}
+    save(directory / "summary.json", summary)
+    return summary
+
+
 def run_service(arguments, mode, directory, inputs):
     directory.mkdir()
     (directory / "host").mkdir()
@@ -171,11 +238,23 @@ def run_service(arguments, mode, directory, inputs):
         if connection.connect_ex(("127.0.0.1", arguments.port)) == 0:
             raise RuntimeError(f"Port {arguments.port} is already in use")
     environment = os.environ.copy()
-    overrides = {"SGLANG_AMD_FLASH_NEXT_0518": "1" if mode == "monokernel" else "0", "SGLANG_AMD_MONO_0518": "0", "SGLANG_AMD_PROFILE_RANGES": "1", "SGLANG_AMD_PROFILE_EVENT_DIR": str(directory / "host"), "SGLANG_AMD_FLASH_REPORT_DIR": str(directory / "runtime"), "SGLANG_AMD_FLASH_ACCURACY_REFERENCE": "0", "SGLANG_AMD_FLASH_SHADOW_STEPS": "1", "SGLANG_AMD_FLASH_SHADOW_REARM_ON_PREFILL": "0", "SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES": "1", "SGLANG_PROFILE_V2": "0", "QWEN_FLASH_NEXT_MODEL_PATH": arguments.model_path}
+    overrides = {"SGLANG_AMD_FLASH_NEXT_0518": "1" if mode == "monokernel" else "0", "SGLANG_AMD_MONO_0518": "0", "SGLANG_AMD_PROFILE_RANGES": "0" if arguments.hipprof else "1", "SGLANG_AMD_PROFILE_EVENT_DIR": str(directory / "host"), "SGLANG_AMD_FLASH_REPORT_DIR": str(directory / "runtime"), "SGLANG_AMD_FLASH_ACCURACY_REFERENCE": "0", "SGLANG_AMD_FLASH_SHADOW_STEPS": "1", "SGLANG_AMD_FLASH_SHADOW_REARM_ON_PREFILL": "0", "SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES": "1", "SGLANG_PROFILE_V2": "0", "QWEN_FLASH_NEXT_MODEL_PATH": arguments.model_path}
+    if arguments.decode_graph:
+        overrides["HIP_GRAPH_ACCUMULATE_DISPATCH"] = "0"
     environment.update(overrides)
     environment.pop("SGLANG_AMD_FLASH_ACCURACY_TRACE_DIR", None)
     launcher = "launch_qwen_flash_next_monokernel.sh" if mode == "monokernel" else "launch_qwen_flash_next.sh"
     command = ["bash", str(ROOT / launcher), "--port", str(arguments.port), "--skip-server-warmup", "--enable-metrics", "--enable-cache-report", "--stream-interval", "1", "--max-running-requests", str(arguments.batch_size)]
+    session = None
+    if arguments.hipprof:
+        session = f"flashnext-{mode}-{os.getpid()}"
+        (directory / "hipprof").mkdir()
+        command = ["hipprof", "--hip-trace", "--follow-fork", "--trace-off", "--session", session,
+                   "--output-type", "2", "-o", str(directory / "hipprof" / f"{mode}.pftrace"),
+                   "-d", str(directory / "hipprof"), *command]
+    if arguments.decode_graph:
+        batch_sizes = [str(size) for size in range(1, arguments.batch_size + 1)]
+        command += ["--cuda-graph-backend-decode", "full", "--cuda-graph-max-bs-decode", str(arguments.batch_size), "--cuda-graph-bs-decode", *batch_sizes, "--disable-cuda-graph-padding"]
     with (directory / "server.log").open("w") as log:
         server = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     launch = {"pid": server.pid, "command": command, "environment_overrides": overrides, "started_at": datetime.now(timezone.utc).isoformat(), "stopped": False}
@@ -195,15 +274,20 @@ def run_service(arguments, mode, directory, inputs):
             time.sleep(2)
         else:
             raise TimeoutError(f"{mode} startup exceeded {arguments.startup_timeout} seconds")
+        if arguments.hipprof:
+            return hipprof_capture(arguments, mode, directory, url, inputs, session)
         return capture(arguments, mode, directory, url, inputs)
     finally:
         if server.poll() is None:
-            os.killpg(server.pid, signal.SIGTERM)
-            try:
-                server.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                os.killpg(server.pid, signal.SIGKILL)
-                server.wait(timeout=20)
+            if arguments.hipprof:
+                stop_under_hipprof(server, arguments.port)
+            else:
+                os.killpg(server.pid, signal.SIGTERM)
+                try:
+                    server.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    os.killpg(server.pid, signal.SIGKILL)
+                    server.wait(timeout=20)
         launch.update(stopped=True, returncode=server.returncode, stopped_at=datetime.now(timezone.utc).isoformat())
         save(directory / "launch.json", launch)
 
@@ -230,10 +314,13 @@ def main():
     parser.add_argument("--batch-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--with-stack", action="store_true")
+    parser.add_argument("--decode-graph", action="store_true", help="Capture decode CUDA graphs for exactly the profiled batch sizes")
+    parser.add_argument("--hipprof", action="store_true", help="Trace with hipprof (HIP API/kernel/copy) instead of the torch profiler; writes a .pftrace per mode")
     parser.add_argument("--keep-python-functions", action="store_true")
     parser.add_argument("--port", type=int, default=30160)
     parser.add_argument("--url", help="Attach to an existing server with profiling ranges already enabled")
     parser.add_argument("--host-event-dir", help="Frontend event directory configured on an attached server")
+    parser.add_argument("--allow-busy-gpus", action="store_true", help="only warn, instead of refusing to start, when another job is using the GPUs")
     parser.add_argument("--startup-timeout", type=int, default=1200)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Append missing modes to an existing run directory without replacing captures")
@@ -260,6 +347,10 @@ def main():
     save(directory / "manifest.json", manifest)
     summaries = {}
     try:
+        if arguments.hipprof and arguments.url:
+            parser.error("--hipprof must launch the server itself so it can wrap it")
+        manifest["gpu_usage_before"] = check_gpus_idle(require=not (arguments.allow_busy_gpus or arguments.url))
+        save(directory / "manifest.json", manifest)
         inputs = prompts(arguments.model_path, arguments.input_tokens, arguments.batch_size)
         for mode in selected_modes:
             if arguments.url:
@@ -267,12 +358,14 @@ def main():
                 summaries[mode] = capture(arguments, mode, directory / mode, arguments.url.rstrip("/"), inputs)
             else:
                 summaries[mode] = run_service(arguments, mode, directory / mode, inputs)
+            if not arguments.hipprof:
+                report(directory, summaries)
+        if not arguments.hipprof:
+            for mode in ("native", "monokernel"):
+                path = directory / mode / "summary.json"
+                if mode not in summaries and path.exists():
+                    summaries[mode] = json.loads(path.read_text())
             report(directory, summaries)
-        for mode in ("native", "monokernel"):
-            path = directory / mode / "summary.json"
-            if mode not in summaries and path.exists():
-                summaries[mode] = json.loads(path.read_text())
-        report(directory, summaries)
         manifest["captured_modes"] = sorted(summaries)
         manifest["complete"] = True
     except BaseException as error:

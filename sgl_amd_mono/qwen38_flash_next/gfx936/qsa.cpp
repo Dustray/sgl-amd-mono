@@ -111,7 +111,8 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
                 if (slot < 0 || slot >= args.cache_slots) valid = false;
             }
         }
-        if (args.mix.rows == 2 && row == 0 && (args.requests[0] == args.requests[1] || args.locations[0] == args.locations[1])) valid = false;
+        bool reserved = request == 0 && location == 0;
+        if (!reserved && args.mix.rows == 2 && row == 0 && (args.requests[0] == args.requests[1] || args.locations[0] == args.locations[1])) valid = false;
         if (!valid) atomicCAS(args.mix.synchronization + 2, 0u, 400u);
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 400)) return;

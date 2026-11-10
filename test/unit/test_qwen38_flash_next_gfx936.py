@@ -67,6 +67,15 @@ def test_unsupported_server_features_are_rejected_before_source_check(model_conf
         validate_server(args)
 
 
+def test_unvalidated_fused_topk_environment_is_rejected_before_loading(model_config, monkeypatch):
+    path, _ = model_config
+    monkeypatch.setenv("SGLANG_AMD_FLASH_NEXT_0518", "1")
+    monkeypatch.setenv("SGLANG_USE_FUSED_TOPK_SOFTMAX", "1")
+    args = SimpleNamespace(model_path=path, tp_size=8)
+    with pytest.raises(FlashContractError, match="SGLANG_USE_FUSED_TOPK_SOFTMAX"):
+        validate_server(args)
+
+
 @pytest.mark.parametrize("decode,rows,tokens,expected", [(True, 1, 1, True), (True, 2, 2, True), (False, 1, 1, False), (True, 3, 3, False), (True, 1, 4, False)])
 def test_decode_routing_does_not_capture_prefill_or_verify(decode, rows, tokens, expected):
     batch = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode), batch_size=rows, input_ids=SimpleNamespace(numel=lambda: tokens))
@@ -89,12 +98,25 @@ def test_qsa_cache_views_preserve_physical_slots(layout):
     assert actual_value.data_ptr() == value.data_ptr()
 
 
-@pytest.mark.parametrize("override,reason", [({"cuda_graph_backend_decode": "full"}, "Graph padding"), ({"cuda_graph_backend_prefill": "piecewise"}, "cuda-graph-backend-prefill disabled"), ({"attention_backend": "aiter"}, "attention-backend triton"), ({"page_size": 32}, "page-size 64"), ({"kv_cache_dtype": "fp8_e4m3"}, "BF16 KV"), ({"ple_offload_embedding": True}, "ple_offload_embedding"), ({"enable_return_indexer_topk": True}, "enable_return_indexer_topk"), ({"load_format": "dummy"}, "real checkpoint"), ({"disable_radix_cache": False}, "checkpoint reuse")])
+@pytest.mark.parametrize("override,reason", [({"cuda_graph_backend_decode": "full"}, "disable-cuda-graph-padding"), ({"cuda_graph_backend_prefill": "piecewise"}, "cuda-graph-backend-prefill disabled"), ({"attention_backend": "aiter"}, "attention-backend triton"), ({"page_size": 32}, "page-size 64"), ({"kv_cache_dtype": "fp8_e4m3"}, "BF16 KV"), ({"ple_offload_embedding": True}, "ple_offload_embedding"), ({"enable_return_indexer_topk": True}, "enable_return_indexer_topk"), ({"load_format": "dummy"}, "real checkpoint"), ({"disable_radix_cache": False}, "checkpoint reuse")])
 def test_unvalidated_cache_and_capture_modes_are_rejected(model_config, override, reason):
     path, _ = model_config
     options = dict(model_path=path, tp_size=8, disable_overlap_schedule=True, context_length=4096, max_running_requests=1, dtype="bfloat16", moe_runner_backend="triton", attention_backend="triton", page_size=64, kv_cache_dtype="bfloat16", cuda_graph_backend_decode="disabled", disable_radix_cache=True)
     options.update(override)
     with pytest.raises(FlashContractError, match=reason):
+        validate_server(SimpleNamespace(**options))
+
+
+def test_exact_graph_batch_sizes_are_accepted(model_config, monkeypatch):
+    import sgl_amd_mono.qwen38_flash_next.gfx936.contract as contract
+
+    path, _ = model_config
+    monkeypatch.setenv("HIP_GRAPH_ACCUMULATE_DISPATCH", "0")
+    monkeypatch.setattr(contract, "validate_sources", lambda: {})
+    options = dict(model_path=path, tp_size=8, disable_overlap_schedule=True, context_length=4096, max_running_requests=2, dtype="bfloat16", moe_runner_backend="triton", attention_backend="triton", page_size=64, kv_cache_dtype="bfloat16", cuda_graph_backend_decode="full", cuda_graph_bs_decode=[1, 2], disable_cuda_graph_padding=True, disable_radix_cache=True)
+    assert not validate_server(SimpleNamespace(**options))["disable_reasons"]
+    options["cuda_graph_bs_decode"] = [1, 4]
+    with pytest.raises(FlashContractError, match="explicit --cuda-graph-bs-decode"):
         validate_server(SimpleNamespace(**options))
 
 
@@ -209,6 +231,56 @@ def test_prefill_rearms_shadow_checks_without_losing_validated_batch_sizes(monke
     model.forward(forward_batch=batch(1, "DECODE"))
     assert runtime.shadow_remaining == (1 if rearm else 0)
     assert runtime.validated_batch_sizes == {1, 2}
+
+
+def test_benchmark_native_route_preserves_fused_shadow_state(monkeypatch):
+    runtime = FlashRuntime.__new__(FlashRuntime)
+    runtime.enabled = False
+    runtime.fusion_enabled = False
+    runtime.forward_keys = set()
+    runtime.shadow_remaining = 1
+    runtime.shadow_rearm_on_prefill = False
+    runtime.completed_decode_steps = 0
+    runtime.supports = lambda batch: True
+    observed = []
+    model = SimpleNamespace(forward=lambda **kwargs: observed.append(runtime.enabled))
+    runtime._wrap_forward(model)
+    batch = SimpleNamespace(batch_size=2, forward_mode=SimpleNamespace(name="DECODE", is_extend=lambda: False))
+    model.forward(forward_batch=batch)
+    assert observed == [False]
+    assert runtime.shadow_remaining == 1
+    assert runtime.completed_decode_steps == 0
+    assert runtime.forward_keys == {("DECODE", 2, False)}
+
+
+@pytest.mark.parametrize("busy", ["running_batch", "waiting_queue", "cur_batch", None])
+def test_benchmark_mode_switch_requires_idle_scheduler(tmp_path, monkeypatch, busy):
+    from sgl_amd_mono_0518.flash_next import apply_benchmark_mode
+
+    control = tmp_path / "mode.txt"
+    control.write_text("native\n")
+    monkeypatch.setenv("SGLANG_AMD_FLASH_BENCHMARK_CONTROL_FILE", str(control))
+    runtime = SimpleNamespace(fusion_enabled=True)
+    scheduler = SimpleNamespace(running_batch=SimpleNamespace(reqs=[]), waiting_queue=[], cur_batch=None)
+    if busy == "running_batch":
+        scheduler.running_batch.reqs.append(object())
+    elif busy == "waiting_queue":
+        scheduler.waiting_queue.append(object())
+    elif busy == "cur_batch":
+        scheduler.cur_batch = object()
+    if busy:
+        with pytest.raises(RuntimeError, match="idle"):
+            apply_benchmark_mode(runtime, scheduler)
+        assert runtime.fusion_enabled
+    else:
+        apply_benchmark_mode(runtime, scheduler)
+        assert not runtime.fusion_enabled
+        control.write_text("monokernel\n")
+        apply_benchmark_mode(runtime, scheduler)
+        assert runtime.fusion_enabled
+        control.write_text("invalid\n")
+        with pytest.raises(ValueError, match="execution mode"):
+            apply_benchmark_mode(runtime, scheduler)
 
 
 def test_local_failure_latches_report_after_prior_success(monkeypatch):

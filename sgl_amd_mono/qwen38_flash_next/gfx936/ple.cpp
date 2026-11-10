@@ -38,7 +38,7 @@ __global__ __launch_bounds__(Threads, 1) void ple_decode(PLEArguments args) {
     if (blockIdx.x == 0 && threadIdx.x < args.rows) {
         int row = threadIdx.x;
         int64_t slot = args.state_indices[row];
-        if (slot <= 0 || slot >= args.state_slots || (row == 0 && args.rows == 2 && slot == args.state_indices[1])) atomicCAS(args.sync.state + 2, 0u, 500u);
+        if (slot < 0 || slot >= args.state_slots || (slot != 0 && row == 0 && args.rows == 2 && slot == args.state_indices[1])) atomicCAS(args.sync.state + 2, 0u, 500u);
     }
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 500)) return;
     for (int index = blockIdx.x * Threads + threadIdx.x; index < args.rows * Hidden; index += Blocks * Threads) {
@@ -87,6 +87,10 @@ __global__ __launch_bounds__(Threads, 1) void ple_decode(PLEArguments args) {
         int row = index / Hyper;
         int channel = index % Hyper;
         int64_t slot = args.state_indices[row];
+        if (slot == 0) {
+            args.output[index] = args.input[index];
+            continue;
+        }
         BFloat16* history = args.conv_state + (slot * Hyper + channel) * 9;
         float current = float(args.normalized_gated[index]);
         float convolved = float(history[0]) * float(args.conv_weight[channel * 4]);

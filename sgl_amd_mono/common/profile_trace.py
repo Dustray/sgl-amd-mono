@@ -30,7 +30,7 @@ def _operator_rows(events, rank):
 
 
 def _phase_summary(events):
-    forwards = sorted((event for event in events if event.get("ph") == "X" and event.get("name", "").startswith("inference/")), key=lambda event: event["ts"])
+    forwards = sorted((event for event in events if event.get("ph") == "X" and event.get("cat") == "user_annotation" and event.get("name", "").startswith("inference/")), key=lambda event: event["ts"])
     starts = [event["ts"] for event in forwards]
     runtime = {event.get("args", {}).get("correlation"): event for event in events if event.get("ph") == "X" and "runtime" in event.get("cat", "") and "correlation" in event.get("args", {})}
     external = {event.get("args", {}).get("External id"): event for event in events if event.get("cat") == "cpu_op" and "External id" in event.get("args", {})}

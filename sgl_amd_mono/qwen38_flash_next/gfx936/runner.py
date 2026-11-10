@@ -51,6 +51,9 @@ class FlashRuntime:
         self.rank = runner.ps.tp_rank
         self.peers = PeerGroup(self.device, self.rank, get_tp_group().cpu_group)
         self.enabled = False
+        self.fusion_enabled = True
+        self.graph_capture_active = False
+        self.graph = None
         self.report_dir = Path(os.environ.get("SGLANG_AMD_FLASH_REPORT_DIR", "monokernel_reports/flash_next_tp8")).resolve()
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.validation = []
@@ -481,6 +484,7 @@ class FlashRuntime:
 
     def _wrap_forward(self, model):
         original = model.forward
+        self.original_forward = original
 
         @functools.wraps(original)
         def forward(*args, **kwargs):
@@ -490,11 +494,11 @@ class FlashRuntime:
             if batch is None:
                 raise FlashContractError("Flash-Next forward batch is missing")
             previous = self.enabled
-            self.enabled = self.supports(batch)
+            self.enabled = getattr(self, "fusion_enabled", True) and self.supports(batch)
             if not self.enabled and batch.forward_mode.is_extend() and self.shadow_rearm_on_prefill:
                 self.shadow_remaining_by_batch.clear()
                 self.shadow_remaining = self.shadow_steps
-            if self.enabled:
+            if self.enabled and not getattr(self, "graph_capture_active", False):
                 self.shadow_remaining = self.shadow_remaining_by_batch.setdefault(int(batch.batch_size), self.shadow_steps)
             key = (batch.forward_mode.name, int(batch.batch_size), self.enabled)
             if key not in self.forward_keys:
@@ -504,7 +508,7 @@ class FlashRuntime:
                 states = self._decode_states() if self.enabled and self.shadow_remaining else []
                 before = [tensor.clone() for _, tensor in states]
                 result = original(*args, **kwargs)
-                if self.enabled and not torch.cuda.is_current_stream_capturing():
+                if self.enabled and not getattr(self, "graph_capture_active", False) and not torch.cuda.is_current_stream_capturing():
                     self.peers.check()
                     if states:
                         self._full_model_shadow(original, args, kwargs, result, states, before)
@@ -542,6 +546,8 @@ class FlashRuntime:
         return {
             "backend": "flash_next_gfx936_tp8_bf16",
             "stage": "complete_decode",
+            "execution_mode": "monokernel" if getattr(self, "fusion_enabled", True) else "native",
+            "graph": self.graph.snapshot() if getattr(self, "graph", None) is not None else None,
             "whole_decoder_monokernel": status == "serving_shadow_passed",
             "acceptance_status": status,
             "serving_shadow_failure": getattr(self, "serving_shadow_failure", None),

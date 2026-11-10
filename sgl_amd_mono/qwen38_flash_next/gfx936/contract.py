@@ -1,4 +1,5 @@
 import hashlib
+import os
 from importlib import metadata, util
 import json
 from pathlib import Path
@@ -50,6 +51,8 @@ def validate_sources():
 
 def validate_server(server_args):
     report = inspect_model(server_args.model_path, server_args.tp_size)
+    if os.environ.get("SGLANG_AMD_FLASH_NEXT_0518") == "1" and os.environ.get("SGLANG_USE_FUSED_TOPK_SOFTMAX", "0").lower() in ("1", "true"):
+        report["disable_reasons"].append("SGLANG_USE_FUSED_TOPK_SOFTMAX=1 is not numerically validated for Flash-Next fusion; use 0")
     unsupported = [name for name in ("enable_lora", "enable_torch_compile", "enable_dp_attention", "enable_dp_lm_head", "enable_deterministic_inference", "speculative_algorithm", "enable_linear_replayssm", "enable_unified_memory", "enable_return_hidden_states", "enable_return_routed_experts", "enable_return_indexer_topk", "ple_offload_embedding", "enable_two_batch_overlap", "enable_single_batch_overlap") if getattr(server_args, name, None)]
     if unsupported:
         report["disable_reasons"].append(f"unsupported execution features: {unsupported}")
@@ -72,8 +75,17 @@ def validate_server(server_args):
         report["disable_reasons"].append("requires --page-size 64")
     if getattr(server_args, "kv_cache_dtype", None) not in ("bfloat16", "bf16"):
         report["disable_reasons"].append("requires explicit BF16 KV caches")
-    if getattr(server_args, "cuda_graph_backend_decode", None) != "disabled":
-        report["disable_reasons"].append("serving Graph padding is not validated; requires --cuda-graph-backend-decode disabled")
+    graph_backend = getattr(server_args, "cuda_graph_backend_decode", None)
+    if graph_backend == "full":
+        batches = getattr(server_args, "cuda_graph_bs_decode", None)
+        if not batches or not set(batches).issubset({1, 2}) or 1 not in batches:
+            report["disable_reasons"].append("Graph requires explicit --cuda-graph-bs-decode 1 [2]")
+        if not getattr(server_args, "disable_cuda_graph_padding", False):
+            report["disable_reasons"].append("Graph requires --disable-cuda-graph-padding")
+        if os.environ.get("HIP_GRAPH_ACCUMULATE_DISPATCH") != "0":
+            report["disable_reasons"].append("Graph requires HIP_GRAPH_ACCUMULATE_DISPATCH=0 before HIP initialization")
+    elif graph_backend != "disabled":
+        report["disable_reasons"].append("requires decode Graph backend full or disabled")
     if getattr(server_args, "cuda_graph_backend_prefill", "disabled") != "disabled":
         report["disable_reasons"].append("requires --cuda-graph-backend-prefill disabled")
     if not getattr(server_args, "disable_radix_cache", False):

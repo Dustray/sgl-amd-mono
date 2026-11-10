@@ -100,6 +100,15 @@ def mark_callable(instance, name):
     instance_type._mono_profile_wrapped = True
 
 
+def inference_range(runner, batch):
+    import torch
+
+    mode = getattr(getattr(batch, "forward_mode", None), "name", "UNKNOWN")
+    rows = getattr(batch, "batch_size", 0)
+    runner._mono_profile_sequence = getattr(runner, "_mono_profile_sequence", 0) + 1
+    return torch.profiler.record_function(f"inference/{mode}/step={runner._mono_profile_sequence}/batch={rows}")
+
+
 def install_model_ranges(runner, runtime=None):
     import torch
 
@@ -117,18 +126,13 @@ def install_model_ranges(runner, runtime=None):
                 if callable(original):
                     setattr(module, method, wrap_range(original, f"module/{name}.{method}"))
     original_forward = runner.model.forward
-    sequence = 0
 
     @functools.wraps(original_forward)
     def forward(*args, **kwargs):
-        nonlocal sequence
         batch = kwargs.get("forward_batch")
         if batch is None and len(args) > 2:
             batch = args[2]
-        mode = getattr(getattr(batch, "forward_mode", None), "name", "UNKNOWN")
-        rows = getattr(batch, "batch_size", 0)
-        sequence += 1
-        with torch.profiler.record_function(f"inference/{mode}/step={sequence}/batch={rows}"):
+        with inference_range(runner, batch):
             return original_forward(*args, **kwargs)
 
     runner.model.forward = forward

@@ -1,12 +1,6 @@
 # SGLang-AMD-Mono
 
-> 原生与 Monokernel 的完整推理时间线、八卡 GPU / CPU 详细算子及 Perfetto 文件采集见 [PROFILING.md](PROFILING.md)。
-
-> 本地 SGLang 0.5.18 / gfx936 开发分支的源码基线、改动清单和升级流程见 [LOCAL_DEVELOPMENT.md](LOCAL_DEVELOPMENT.md)。Qwen 27B 实现位于 [sgl_amd_mono/qwen38_27b/](sgl_amd_mono/qwen38_27b/README.md)，旧版接口桥接位于 `compat/sglang0518/`；本机 TP1、BF16、gfx936/80 CU、batch 1/2 的完整 decode 路径已接入，每步 129 次发射。验收记录绑定源码和环境，实际配置与结果见 [接入进度](Qwen3.8-27B%20正式融合接入进度.md)。本地实现采用 DTK HIP；2026-11-06 已完成同卡 18 组[性能实测](Qwen3.8-27B%20原生与Monokernel性能对比.md)，当前配置下 Monokernel 端到端耗时为原生的 2.89–12.10 倍，尚未获得加速。
-
-> 本机 BF16 Flash-Next 的原生记录见 [启动验证](Qwen3.8-Flash-Next%20启动验证.md)。本地 TP8 / gfx936 Monokernel 新实现、99-launch decode 路径、启动方式和实际验收结果见 [接入进度](Qwen3.8-Flash-Next%20TP8%20gfx936%20Monokernel%20接入进度.md)，计算代码位于 [模型 gfx936 目录](sgl_amd_mono/qwen38_flash_next/gfx936/README.md)。2026-11-06 的 batch 1、512→64 [实测](testresult.md)中，端到端 / decode 加速比分别为 2.015× / 2.105×；后续 [正确性补测](Qwen3.8-Flash-Next%20正确性验证.md)的 13 个标准答案通过，但 512→64 严格逐步数值验收未通过，完整等价性尚未成立，其余 batch / 长度尚未形成性能结论。
-
-> 最新 [完整精度验收](Qwen3.8-Flash-Next%20完整精度验收.md)已测完 batch 1/2 的 7 个长度组合、472 个融合 decode forward，全部保留原有门槛，完整精度未通过。HC 最后混合的舍入差异已在固定输入下定位；长输入还有原生参考重复不一致。报告另列独立确定性基线和默认原生输出对照。历史性能数值不代表当前源码通过精度验收后的性能。
+> **本地分支说明（gfx936 / SGLang 0.5.18）**：当前只关注 Qwen3.8-Flash-Next BF16 TP8 的原生与 Monokernel 性能。结论与测试方法见 [Flash-Next 性能对比.md](Flash-Next%20性能对比.md)，测试脚本为 `bench_flash_next.py`；面向 AI agent 的开发说明见 [AGENTS.md](AGENTS.md)。历史文档、27B 相关脚本与旧日志已移至 `archive/`。
 
 ## Introduction
 

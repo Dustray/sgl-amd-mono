@@ -74,9 +74,16 @@ def main():
         for mode in ("eager", "graph"):
             graph = None
             if mode == "graph":
+                real_indices = indices.clone()
+                initial_conv = conv.clone()
+                indices.zero_()
+                dummy = kernel(hidden, contexts, indices, conv)
+                assert torch.equal(dummy, hidden) and torch.equal(conv, initial_conv)
+                peers.check()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     output = kernel(hidden, contexts, indices, conv)
+                indices.copy_(real_indices)
             for step in range(6):
                 if step == 3:
                     contexts[:, 1] = 248044
