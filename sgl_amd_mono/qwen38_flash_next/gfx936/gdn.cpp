@@ -65,6 +65,7 @@ __device__ __forceinline__ float gdn_softplus(float value) {
 }
 
 __global__ __launch_bounds__(Threads, 1) void gdn_attention(GDNArguments args) {
+    stage_mark(702);
     __shared__ float query[Head];
     __shared__ float key[Head];
     __shared__ float head_output[Head];

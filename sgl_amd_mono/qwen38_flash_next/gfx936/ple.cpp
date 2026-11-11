@@ -34,6 +34,7 @@ struct PLEArguments {
 };
 
 __global__ __launch_bounds__(Threads, 1) void ple_decode(PLEArguments args) {
+    stage_mark(704);
     if (args.sync.state[2]) return;
     if (blockIdx.x == 0 && threadIdx.x < args.rows) {
         int row = threadIdx.x;

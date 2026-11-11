@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sgl_amd_mono.common.profile_trace import merge_profiles, read_trace
+from sgl_amd_mono.common.profile_trace import _embed_device_stage_events, merge_profiles, read_trace
 from sgl_amd_mono.common.profiling import async_host_range, host_range, install_model_ranges, mark_callable
 
 
@@ -69,6 +69,93 @@ def test_merge_rejects_incomplete_capture(tmp_path, failure):
     with pytest.raises(ValueError):
         merge_profiles([path, path] if failure == "duplicate_rank" else [path], tmp_path / "merged.json.gz", expected_ranks=2 if failure == "missing_rank" else 1, expected_decode_steps=2 if failure == "decode_coverage" else 1, expected_decode_token_rows=2 if failure == "decode_token_coverage" else 1)
     assert not (tmp_path / "merged.json.gz").exists()
+
+
+def test_device_stages_align_to_fused_torch_kernels():
+    kernels = [
+        {"ph": "X", "cat": "kernel", "name": "decode_entry(EntryArguments)", "pid": 1, "tid": 10, "ts": 100, "dur": 10, "args": {"correlation": 1}},
+        {"ph": "X", "cat": "kernel", "name": "gdn_attention(GDNArguments)", "pid": 1, "tid": 10, "ts": 120, "dur": 20, "args": {"correlation": 2}},
+        {"ph": "X", "cat": "kernel", "name": "post_attention(PostArguments)", "pid": 1, "tid": 10, "ts": 145, "dur": 30, "args": {"correlation": 3}},
+        {"ph": "X", "cat": "kernel", "name": "decode_tail(TailArguments)", "pid": 1, "tid": 10, "ts": 180, "dur": 22, "args": {"correlation": 4}},
+    ]
+    stage_spans = [
+        {"ph": "X", "cat": "stage", "name": "step 1", "pid": 0, "tid": 1, "ts": 0, "dur": 100, "args": {"depth": 0}},
+        {"ph": "X", "cat": "stage", "name": "entry", "pid": 0, "tid": 1, "ts": 0, "dur": 5, "args": {"depth": 2}},
+        {"ph": "X", "cat": "stage", "name": "embed lookup", "pid": 0, "tid": 1, "ts": 0, "dur": 4, "args": {"depth": 3}},
+        {"ph": "X", "cat": "stage", "name": "layer 0 gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 30, "args": {"depth": 1}},
+        {"ph": "X", "cat": "stage", "name": "gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 20, "args": {"depth": 2}},
+        {"ph": "X", "cat": "stage", "name": "mix.down", "pid": 0, "tid": 1, "ts": 21, "dur": 3, "args": {"depth": 3}},
+        {"ph": "X", "cat": "stage", "name": "layer 0 gdn+post", "pid": 0, "tid": 1, "ts": 45, "dur": 30, "args": {"depth": 2}},
+        {"ph": "X", "cat": "stage", "name": "tail", "pid": 0, "tid": 1, "ts": 80, "dur": 20, "args": {"depth": 2}},
+    ]
+    second_step = [
+        {**event, "name": "step 2" if event["name"] == "step 1" else event["name"],
+         "ts": event["ts"] + 100}
+        for event in stage_spans
+    ]
+    embedded, summary = _embed_device_stage_events(
+        kernels + [{**event, "ts": event["ts"] + 100} for event in kernels],
+        {"traceEvents": stage_spans + second_step}, rank=0,
+    )
+    entry = next(event for event in embedded if event["name"] == "entry")
+    segment = next(event for event in embedded if event["name"] == "layer 00 gdn / mix.down")
+    assert entry["ts"] == 100 and entry["dur"] == 10 and entry["tid"] == 10
+    assert segment["ts"] == 121 and segment["dur"] == 3 and segment["args"]["kernel_correlation"] == 2
+    assert summary == {"steps": 2, "launches": 8, "spans": len(stage_spans) * 2, "pid": 1, "tid": 10,
+                       "max_launch_start_error_us": 0}
+
+
+def test_merge_embeds_device_stages_on_named_tracks(tmp_path):
+    fused = [
+        ("decode_entry(EntryArguments)", 210, 10),
+        ("gdn_attention(GDNArguments)", 230, 20),
+        ("post_attention(PostArguments)", 255, 30),
+        ("decode_tail(TailArguments)", 290, 22),
+    ]
+    stage_spans = [
+        {"ph": "X", "cat": "stage", "name": "step 1", "pid": 0, "tid": 1, "ts": 0, "dur": 100, "args": {"depth": 0}},
+        {"ph": "X", "cat": "stage", "name": "entry", "pid": 0, "tid": 1, "ts": 0, "dur": 5, "args": {"depth": 2}},
+        {"ph": "X", "cat": "stage", "name": "embed lookup", "pid": 0, "tid": 1, "ts": 0, "dur": 4, "args": {"depth": 3}},
+        {"ph": "X", "cat": "stage", "name": "layer 0 gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 30, "args": {"depth": 1}},
+        {"ph": "X", "cat": "stage", "name": "gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 20, "args": {"depth": 2}},
+        {"ph": "X", "cat": "stage", "name": "mix.down", "pid": 0, "tid": 1, "ts": 21, "dur": 3, "args": {"depth": 3}},
+        {"ph": "X", "cat": "stage", "name": "layer 0 gdn+post", "pid": 0, "tid": 1, "ts": 45, "dur": 30, "args": {"depth": 2}},
+        {"ph": "X", "cat": "stage", "name": "tail", "pid": 0, "tid": 1, "ts": 80, "dur": 20, "args": {"depth": 2}},
+    ]
+    second_step = [
+        {**event, "name": "step 2" if event["name"] == "step 1" else event["name"],
+         "ts": event["ts"] + 100}
+        for event in stage_spans
+    ]
+    paths = []
+    for rank in range(2):
+        path = rank_trace(tmp_path, rank)
+        trace = read_trace(path)
+        trace["traceEvents"].extend(
+            {"ph": "X", "cat": "kernel", "name": name, "pid": 1, "tid": 10, "ts": ts, "dur": dur, "args": {"correlation": index}}
+            for index, (name, ts, dur) in enumerate(fused + [(name, ts + 100, dur) for name, ts, dur in fused])
+        )
+        with gzip.open(path, "wt") as output:
+            json.dump(trace, output)
+        with (tmp_path / f"stage-timing-decode-rank-{rank}.json").open("w") as output:
+            json.dump({"traceEvents": stage_spans + second_step}, output)
+        paths.append(path)
+
+    summary = merge_profiles(paths, tmp_path / "merged.json.gz", expected_ranks=2, expected_decode_steps=1,
+                             device_stage_directory=tmp_path)
+    events = read_trace(tmp_path / "merged.json.gz")["traceEvents"]
+    entry_kernel = next(event for event in events if event.get("cat") == "kernel" and event.get("name", "").startswith("decode_entry("))
+    entry_span = next(event for event in events if event.get("cat") == "mono_kernel" and event.get("name") == "entry")
+    assert (entry_span["pid"], entry_span["ts"], entry_span["dur"]) == (
+        entry_kernel["pid"], entry_kernel["ts"], entry_kernel["dur"])
+    assert entry_span["tid"] != entry_kernel["tid"]
+    track = next(event for event in events if event.get("ph") == "M" and event.get("name") == "thread_name"
+                 and event.get("pid") == entry_span["pid"] and event.get("tid") == entry_span["tid"])
+    assert "Monokernel internal stages" in track["args"]["name"]
+    assert summary["device_kernel_stages"]["ranks"] == [0, 1]
+    assert summary["device_kernel_stages"]["steps"] == 2
+    assert summary["device_kernel_stages"]["launches"] == 16
+    assert any(event.get("cat") == "mono_kernel_stage" and event.get("name") == "layer 00 gdn / mix.down" for event in events)
 
 
 def test_host_ranges_only_record_capture_window_and_preserve_async_exceptions(tmp_path, monkeypatch):

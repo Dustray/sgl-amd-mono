@@ -26,6 +26,7 @@ struct TailArguments {
 };
 
 __global__ __launch_bounds__(Threads, 1) void decode_entry(EntryArguments args) {
+    stage_mark(705);
     if (args.sync.state[2]) return;
     for (int index = blockIdx.x * Threads + threadIdx.x; index < args.rows * Hidden; index += Blocks * Threads) {
         int row = index / Hidden;
@@ -83,6 +84,7 @@ __device__ __forceinline__ bool gather_logits(TailArguments args, int offset, in
 }
 
 __global__ __launch_bounds__(Threads, 1) void decode_tail(TailArguments args) {
+    stage_mark(706);
     if (!run_mix(args.mix, 640)) return;
     gemv(args.mix.output, args.weight, args.local, nullptr, args.mix.rows, Hidden, LocalVocab, 0);
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 644)) return;

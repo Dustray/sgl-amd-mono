@@ -97,14 +97,57 @@ class FlashRuntime:
         self.tail = HCMix(hc.hc_norm.weight, hc.input_mix_weight_down.weight, hc.input_mix_weight_up.weight)
         self.tail.state = self.peers.state
         self.io = DecodeIO(runner.model, self.tail, self.peers)
+        self.stage_timing = None
         self._validate_communication()
         self._validate_weights()
+        if os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING", "0") == "1":
+            self._attach_stage_timing()
         self.counter_offsets = self.execution_counts()
         for layer_id, layer in enumerate(self.model.layers):
             self._wrap_layer(layer_id, layer)
         self._wrap_decode_io(runner.model)
         self._wrap_forward(runner.model)
         self.save()
+
+    def _attach_stage_timing(self):
+        from .stage_timing import StageTiming
+
+        records = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_RECORDS", str(1 << 18)))
+        timing = StageTiming(self.device, self.rank, records)
+        programs = {id(self.peers.program): self.peers.program, id(self.io.program): self.io.program}
+        for module in (*self.mixers, *self.posts, *self.ple):
+            if module is not None:
+                programs[id(module.program)] = module.program
+        for module in (*self.gdn, *self.qsa):
+            if module is not None:
+                programs[id(module.program)] = module.program
+        for program in programs.values():
+            timing.attach(program)
+        self.stage_timing = timing
+        logger.info("AMD_FLASH_STAGE_TIMING attached to %s libraries on rank %s, %s records", len(programs), self.rank, records)
+
+    def export_stage_timing(self, label="decode"):
+        if self.stage_timing is None:
+            raise FlashContractError("Flash-Next stage timing is not enabled")
+        clock_khz = self.peers.program.information.get("clock_khz")
+        return self.stage_timing.export(self.report_dir / f"stage-timing-{label}-rank-{self.rank}.json", clock_khz)
+
+    def begin_stage_timing_step(self):
+        if self.stage_timing is None:
+            return
+        step = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_STEP", "0"))
+        if step > 0 and self.completed_decode_steps + 1 == step:
+            self.stage_timing.reset()
+
+    def finish_stage_timing_step(self):
+        if self.stage_timing is None:
+            return
+        first_step = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_STEP", "0"))
+        step_count = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_STEPS", "1"))
+        last_step = first_step + step_count - 1
+        if first_step > 0 and step_count > 0 and self.completed_decode_steps == last_step:
+            torch.cuda.synchronize(self.device)
+            logger.info("AMD_FLASH_STAGE_TIMING exported rank %s %s", self.rank, self.export_stage_timing())
 
     @staticmethod
     def native_post(layer, attention, residuals, batch=None):
@@ -505,6 +548,8 @@ class FlashRuntime:
                 self.forward_keys.add(key)
                 logger.info("AMD_FLASH_TP8_ROUTE key=%s route=%s", key, "gfx936_tp8_bf16_decode" if self.enabled else "sglang_original")
             try:
+                if self.enabled and not getattr(self, "graph_capture_active", False):
+                    self.begin_stage_timing_step()
                 states = self._decode_states() if self.enabled and self.shadow_remaining else []
                 before = [tensor.clone() for _, tensor in states]
                 result = original(*args, **kwargs)
@@ -513,6 +558,7 @@ class FlashRuntime:
                     if states:
                         self._full_model_shadow(original, args, kwargs, result, states, before)
                     self.completed_decode_steps += 1
+                    self.finish_stage_timing_step()
                     if self.shadow_remaining:
                         self.shadow_remaining -= 1
                         self.shadow_remaining_by_batch[int(batch.batch_size)] = self.shadow_remaining

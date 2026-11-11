@@ -94,6 +94,25 @@ __device__ __forceinline__ float wave_sum(float value) {
     return __shfl(value, 0, 64);
 }
 
+// Device-side stage timing. The host attaches one int64 buffer per rank; grid_sync records
+// (stage, wall_clock64()) at every barrier, so consecutive records bound one stage of one kernel.
+// Layout: [0] cursor, [1] dropped flag, [2 + 2n] = stage, [3 + 2n] = ticks.
+__device__ int64_t* stage_buffer = nullptr;
+__device__ int64_t stage_capacity = 0;
+
+__device__ __forceinline__ void stage_mark(unsigned int stage) {
+    int64_t capacity = stage_capacity;
+    if (stage_buffer == nullptr || capacity < 4 || blockIdx.x != 0 || threadIdx.x != 0) return;
+    unsigned long long index = atomicAdd(reinterpret_cast<unsigned long long*>(stage_buffer), 1ull);
+    if (index >= static_cast<unsigned long long>(capacity / 2 - 1)) {
+        stage_buffer[1] = 1;
+        return;
+    }
+    volatile int64_t* record = stage_buffer + 2 + index * 2;
+    record[0] = static_cast<int64_t>(stage);
+    record[1] = static_cast<int64_t>(wall_clock64());
+}
+
 __device__ __forceinline__ bool grid_sync(unsigned int* state, int64_t timeout, unsigned int stage) {
     __shared__ int success;
     __threadfence();
@@ -120,6 +139,7 @@ __device__ __forceinline__ bool grid_sync(unsigned int* state, int64_t timeout, 
     }
     __syncthreads();
     __threadfence();
+    if (success) stage_mark(stage);
     return success;
 }
 
@@ -301,10 +321,12 @@ __device__ __forceinline__ bool inject(const BFloat16* block, const BFloat16* re
 }
 
 __global__ __launch_bounds__(Threads, 1) void hc_mix(MixArguments args) {
+    stage_mark(700);
     if (run_mix(args, 1) && blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(args.executions, 1);
 }
 
 __global__ __launch_bounds__(Threads, 1) void post_attention(PostArguments args) {
+    stage_mark(701);
     if (!all_reduce(args.attention, args.reduced_attention, args.rows * Hidden, args.sync, 10)) return;
     if (!inject(args.reduced_attention, args.residual, args.normalized_residual, args.attention_inject, args.inject_gates, args.post_attention, args.rows, args.sync, 20)) return;
     MixArguments mix{args.post_attention, args.norm_weight, args.mix_down, args.mix_up, args.normalized, args.lowrank, args.gates, args.mixed, args.sync.state, args.executions, args.rows, args.sync.timeout_ticks};
@@ -447,6 +469,13 @@ extern "C" int flash_info(int64_t* result) {
     int64_t values[] = {sizeof(MixArguments), sizeof(PostArguments), sizeof(SyncArguments), sizeof(PeerMemory), cooperative, multiprocessors, mix_occupancy, post_occupancy, clock};
     std::memcpy(result, values, sizeof(values));
     return hipSuccess;
+}
+
+extern "C" int flash_stage_attach(void* buffer, int64_t capacity) {
+    int64_t ticks = capacity;
+    hipError_t status = hipMemcpyToSymbol(HIP_SYMBOL(stage_buffer), &buffer, sizeof(void*));
+    if (status != hipSuccess) return status;
+    return hipMemcpyToSymbol(HIP_SYMBOL(stage_capacity), &ticks, sizeof(ticks));
 }
 
 extern "C" int flash_allocate(void** pointer, void* handle) {

@@ -146,6 +146,34 @@ def server_environment(arguments, directory):
     return environment, overrides
 
 
+def server_exit_detail(log_path):
+    """Extract the last traceback / fatal line(s) from server.log so the real cause
+    (e.g. FlashContractError) is visible even when SGLang's kill_process_tree makes
+    the wrapper exit with -9."""
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    starts = [i for i, line in enumerate(lines) if "Traceback (most recent call last)" in line]
+    if not starts:
+        fatal = [line for line in lines if any(word in line for word in ("Error:", "Exception", "SIGKILL", "Killed"))]
+        return "\n".join(fatal[-3:])
+    tail = lines[starts[-1]:]
+    # The final exception line is the first non-indented, non-empty line at the end of the traceback.
+    exception_line = ""
+    for line in reversed(tail):
+        if line and not line.startswith((" ", "\t")):
+            exception_line = line
+            break
+    # Keep the traceback header, "  File ..." frames and the final exception line.
+    frames = [line for line in tail if not line.lstrip().startswith(("^", "~"))]
+    if len(frames) > 12:
+        frames = frames[:2] + ["  ..."] + frames[-4:]
+    if exception_line and exception_line not in frames:
+        frames.append(exception_line)
+    return "\n".join(frames)
+
+
 def start_server(arguments, directory):
     with socket.socket() as connection:
         if connection.connect_ex(("127.0.0.1", arguments.port)) == 0:
@@ -160,7 +188,9 @@ def start_server(arguments, directory):
     deadline = time.monotonic() + arguments.startup_timeout
     while time.monotonic() < deadline:
         if server.poll() is not None:
-            raise RuntimeError(f"server exited with {server.returncode}; see {directory / 'server.log'}")
+            detail = server_exit_detail(directory / "server.log")
+            suffix = f"\n{detail}" if detail else ""
+            raise RuntimeError(f"server exited with {server.returncode}; see {directory / 'server.log'}{suffix}")
         try:
             if requests.get(url + "/health", timeout=3).ok:
                 print(f"server ready after {time.monotonic() - deadline + arguments.startup_timeout:.0f}s", flush=True)

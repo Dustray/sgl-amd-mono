@@ -145,7 +145,8 @@ def capture(arguments, mode, directory, url, inputs):
     trace_paths = list(raw_directory.glob("*TP-*.trace.json.gz"))
     client_events = [event for _, events in results for event in events]
     save(host_directory / "client.json", client_events)
-    summary = merge_profiles(trace_paths, directory / "inference.perfetto.json.gz", host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1))
+    stage_directory = directory / "runtime" if arguments.kernel_stages and mode == "monokernel" else None
+    summary = merge_profiles(trace_paths, directory / "inference.perfetto.json.gz", host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1), device_stage_directory=stage_directory)
     for before_state, after_state in zip(before_shadow, after_shadow):
         expected = next(state["phases"]["DECODE"]["forwards"] for state in summary["ranks"] if state["rank"] == after_state["rank"])
         if after_state["completed_decode_steps"] - before_state["completed_decode_steps"] != expected:
@@ -239,6 +240,10 @@ def run_service(arguments, mode, directory, inputs):
             raise RuntimeError(f"Port {arguments.port} is already in use")
     environment = os.environ.copy()
     overrides = {"SGLANG_AMD_FLASH_NEXT_0518": "1" if mode == "monokernel" else "0", "SGLANG_AMD_MONO_0518": "0", "SGLANG_AMD_PROFILE_RANGES": "0" if arguments.hipprof else "1", "SGLANG_AMD_PROFILE_EVENT_DIR": str(directory / "host"), "SGLANG_AMD_FLASH_REPORT_DIR": str(directory / "runtime"), "SGLANG_AMD_FLASH_ACCURACY_REFERENCE": "0", "SGLANG_AMD_FLASH_SHADOW_STEPS": "1", "SGLANG_AMD_FLASH_SHADOW_REARM_ON_PREFILL": "0", "SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES": "1", "SGLANG_PROFILE_V2": "0", "QWEN_FLASH_NEXT_MODEL_PATH": arguments.model_path}
+    if arguments.kernel_stages and mode == "monokernel":
+        overrides["SGLANG_AMD_FLASH_STAGE_TIMING"] = "1"
+        overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEP"] = str(arguments.warmup * 3 + 1)
+        overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEPS"] = str(arguments.output_tokens - 1)
     if arguments.decode_graph:
         overrides["HIP_GRAPH_ACCUMULATE_DISPATCH"] = "0"
     environment.update(overrides)
@@ -293,7 +298,14 @@ def run_service(arguments, mode, directory, inputs):
 
 
 def report(directory, summaries):
-    lines = ["# Flash-Next TP8 / gfx936 全推理 Profile", "", "范围：文本分词、调度器 CPU / ATen / HIP API、全部 prefill 与 decode forward、八卡 GPU kernels / memcpy、反分词及客户端流式响应。文件为 Perfetto 可导入的 Chrome Trace JSON gzip。", "", "Profile 开销包含在本轮请求耗时中，不能替代独立性能基准。融合路径的精度验收状态单独保留；本采集不宣称精度通过。融合核内部阶段未拆分计时，TP peer 通信等待包含在对应融合核内。", "", "| 模式 | 输入→输出 / batch | 事件数 | 每卡 Prefill / Decode forward | 文件 |", "| --- | --- | ---: | --- | --- |"]
+    lines = ["# Flash-Next TP8 / gfx936 全推理 Profile", "", "范围：文本分词、调度器 CPU / ATen / HIP API、全部 prefill 与 decode forward、八卡 GPU kernels / memcpy、反分词及客户端流式响应。文件为 Perfetto 可导入的 Chrome Trace JSON gzip。", ""]
+    for mode, summary in summaries.items():
+        if mode == "monokernel" and summary.get("device_kernel_stages"):
+            lines.append("核内阶段时间已按 rank 和 kernel 发射顺序对齐到 GPU kernel，并嵌入同一份 Perfetto trace；阶段时间来自设备端 wall clock。")
+            break
+    else:
+        lines.append("核内阶段计时未启用；TP peer 通信等待包含在对应融合 kernel 内。")
+    lines += ["", "Profile 开销包含在本轮请求耗时中，不能替代独立性能基准。融合路径的精度验收状态单独保留；本采集不宣称精度通过。", "", "| 模式 | 输入→输出 / batch | 事件数 | 每卡 Prefill / Decode forward | 文件 |", "| --- | --- | ---: | --- | --- |"]
     for mode, summary in summaries.items():
         phases = summary["ranks"][0]["phases"]
         prefills = sum(value["forwards"] for phase, value in phases.items() if phase != "DECODE")
@@ -317,6 +329,7 @@ def main():
     parser.add_argument("--decode-graph", action="store_true", help="Capture decode CUDA graphs for exactly the profiled batch sizes")
     parser.add_argument("--hipprof", action="store_true", help="Trace with hipprof (HIP API/kernel/copy) instead of the torch profiler; writes a .pftrace per mode")
     parser.add_argument("--keep-python-functions", action="store_true")
+    parser.add_argument("--kernel-stages", action="store_true", help="embed every measured Monokernel decode step's device-stage spans in the torch-profiler Perfetto trace")
     parser.add_argument("--port", type=int, default=30160)
     parser.add_argument("--url", help="Attach to an existing server with profiling ranges already enabled")
     parser.add_argument("--host-event-dir", help="Frontend event directory configured on an attached server")
@@ -325,6 +338,8 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Append missing modes to an existing run directory without replacing captures")
     arguments = parser.parse_args()
+    if arguments.kernel_stages and (arguments.mode != "monokernel" or arguments.hipprof or arguments.url):
+        parser.error("--kernel-stages requires a launched --mode monokernel torch-profiler capture")
     if arguments.url and (arguments.mode == "both" or not arguments.host_event_dir):
         parser.error("Attaching requires one explicit --mode and --host-event-dir")
     if arguments.host_event_dir and not arguments.url:

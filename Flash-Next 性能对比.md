@@ -116,6 +116,25 @@ python3 bench_flash_next.py --mode mono --graph --profile --input-len 512 --outp
 - `--keep-server`：测完不关服务，方便再用 `--url` 接着测别的组合。
 - `--` 之后的内容会原样传给 sglang 作为服务参数。
 
+想看每个融合 kernel 内部各阶段各用了多久（torch profiler 只能看到 kernel 的起止，看不到里面）：
+
+```bash
+SGLANG_AMD_FLASH_STAGE_TIMING=1 SGLANG_AMD_FLASH_STAGE_TIMING_STEP=5 \
+  python3 bench_flash_next.py --mode mono --graph --input-len 512 --output-len 64 --output-dir <运行目录>
+python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime
+```
+
+只采指定的第 5 个 fused decode step（可改），并覆盖 kernel 入口到末尾的所有阶段；eager 和 decode graph 都支持。八张卡分别记录设备端时间，合并后导出 `<运行目录>/runtime/stage-timing.perfetto.json` 和各阶段耗时汇总。粒度到混音、投影、卷积、稀疏注意力选块、路由、专家、两处 all-reduce 等待等。
+
+要把每一步 decode 的核内阶段直接放进完整 torch-profiler trace（与 GPU kernel 同一时间轴），用全量采集工具：
+
+```bash
+python3 tools/profile_flash_next_serving.py --mode monokernel --kernel-stages \
+  --input-tokens 512 --output-tokens 64 --batch-size 1 --output-dir <运行目录>
+```
+
+完整 trace 输出在 `<运行目录>/monokernel/inference.perfetto.json.gz`。工具会跳过预热，只对正式请求的每个 decode step 记录核内阶段；trace 采集会有额外开销，不用于性能验收。
+
 结果默认写到 `bench_results/<时间>_<模式>_<graph|eager>/`。其中 `summary.md` / `summary.csv` 是汇总表，`results.json` 记录每个 token 的到达时间和服务配置，`profile/` 里是 trace。Mono 只支持 batch 1 和 2，输入加输出不能超过 4096。
 
 已有的 Perfetto trace（batch 1，512→64）在 `profiles/` 下：原生、原生 + Graph、Mono 各一份，用 Perfetto UI 的 Open trace file 打开。这三份是 torch profiler 采的，带模型分层标记。
@@ -130,6 +149,3 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --hipprof ...     
 ```
 
 加载模型和预热不会被采集，只采被测的那一次请求。输入 token 和 `profiles/` 下现有三份完全一致。结果是 `<目录>/<模式>/hipprof/<模式>.pftrace`，同样用 Perfetto 打开。
-
-
-

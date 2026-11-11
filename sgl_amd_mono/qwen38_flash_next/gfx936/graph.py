@@ -40,10 +40,12 @@ class GraphExecution:
         validate = not any(check["rows"] == rows and check["accepted"] for check in self.checks)
         states = runtime._decode_states() if validate else []
         before = [tensor.clone() for _, tensor in states]
+        runtime.begin_stage_timing_step()
         result = original(runner, batch, *args, **kwargs)
         runtime.peers.check()
         self.replays[rows] = self.replays.get(rows, 0) + 1
         runtime.completed_decode_steps += 1
+        runtime.finish_stage_timing_step()
         if validate:
             try:
                 self._validate(batch, result, states, before)

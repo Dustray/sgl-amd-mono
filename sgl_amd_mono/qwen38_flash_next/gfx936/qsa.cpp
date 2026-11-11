@@ -88,6 +88,7 @@ __device__ __forceinline__ int64_t qsa_cache_offset(int64_t slot, int column, in
 }
 
 __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
+    stage_mark(703);
     __shared__ float reduction[4];
     __shared__ float normalized[QSADim];
     __shared__ float sort_scores[QSABlocks];

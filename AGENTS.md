@@ -119,6 +119,34 @@ Behaviour worth knowing:
 - `SGLANG_AMD_PROFILE_RANGES` is forced to 0 under `--hipprof`: the torch range markers are not in a HIP trace
   and would only slow the eager path.
 
+## Device-side stage timing
+
+Each kernel records a device-side start timestamp and each grid barrier records
+`(stage, wall_clock64())`, so every kernel-internal phase appears in the profile even though torch
+cannot see inside a fused launch.
+
+```bash
+SGLANG_AMD_FLASH_STAGE_TIMING=1 SGLANG_AMD_FLASH_STAGE_TIMING_STEP=5 SGLANG_AMD_FLASH_REPORT_DIR=<run>/runtime \
+  python3 bench_flash_next.py --mode mono --graph --input-len 512 --output-len 64
+python3 tools/merge_flash_next_stage_timing.py --run-dir <run>/runtime   # 8 ranks -> one Perfetto file + summary
+```
+
+- `stage_mark()` lives in `kernel.cpp` next to `grid_sync`; kernel-entry markers are 700-706 and
+  barrier stage numbers are disjoint per kernel kind (hc_mix 1-4, post 10-61, gdn 300-313,
+  qsa 400-413, ple 500-524, entry 600-620, tail 630-644).
+  Names live in `stage_timing.py:SEGMENTS`; add a name there when you add a barrier.
+- Buffer layout: `[0]` cursor, `[1]` dropped flag, then `(stage, ticks)` pairs. Attach happens per
+  compiled library — each `.so` includes `kernel.cpp` and has its own copy of the device symbol.
+- Only block 0 / thread 0 marks, so the timestamp is "block 0 reached this barrier"; a segment is the
+  delta between consecutive marks. Ticks convert with `clock_khz` from `flash_info`.
+- Ranks do not share a clock: compare ranks by duration, never by absolute timestamp.
+- Graph replay works unchanged (the device pointer is a global, not a kernel parameter). Set
+  `SGLANG_AMD_FLASH_STAGE_TIMING_STEP` to a positive decode-step number to export exactly that step;
+  0 disables automatic export (the default). Eager and graph replay use the same step counter.
+- Previous device validation (2026-11-10, before kernel-entry markers): 4 records per `hc_mix` launch,
+  monotonic ticks; `hc_mix` 342 us, `mix.down` 316 us for one decode row. Unit tests:
+  `test/unit/test_flash_next_stage_timing.py`.
+
 ## Status (2026-11-10)
 
 - Mono decode runs end to end, with and without decode graph. Graph vs. eager mono is bit-identical
