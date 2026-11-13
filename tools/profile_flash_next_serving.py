@@ -146,7 +146,8 @@ def capture(arguments, mode, directory, url, inputs):
     client_events = [event for _, events in results for event in events]
     save(host_directory / "client.json", client_events)
     stage_directory = directory / "runtime" if arguments.kernel_stages and mode == "monokernel" else None
-    summary = merge_profiles(trace_paths, directory / "inference.perfetto.json.gz", host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1), device_stage_directory=stage_directory)
+    trace_name = "inference.mono_only.json.gz" if arguments.mono_only else "inference.perfetto.json.gz"
+    summary = merge_profiles(trace_paths, directory / trace_name, host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1), device_stage_directory=stage_directory, mono_only=arguments.mono_only)
     for before_state, after_state in zip(before_shadow, after_shadow):
         expected = next(state["phases"]["DECODE"]["forwards"] for state in summary["ranks"] if state["rank"] == after_state["rank"])
         if after_state["completed_decode_steps"] - before_state["completed_decode_steps"] != expected:
@@ -309,7 +310,8 @@ def report(directory, summaries):
     for mode, summary in summaries.items():
         phases = summary["ranks"][0]["phases"]
         prefills = sum(value["forwards"] for phase, value in phases.items() if phase != "DECODE")
-        lines.append(f"| {mode} | {summary['prompt_tokens']}→{summary['output_tokens']} / {summary['batch_size']} | {summary['total_events']} | {prefills} / {phases['DECODE']['forwards']} | [{mode} trace]({mode}/inference.perfetto.json.gz) |")
+        trace_name = "inference.mono_only.json.gz" if summary.get("mono_only") else "inference.perfetto.json.gz"
+        lines.append(f"| {mode} | {summary['prompt_tokens']}→{summary['output_tokens']} / {summary['batch_size']} | {summary['total_events']} | {prefills} / {phases['DECODE']['forwards']} | [{mode} trace]({mode}/{trace_name}) |")
     for mode, summary in summaries.items():
         lines += ["", f"## {mode}：rank 0 GPU kernel 累计耗时前十", "", "累计耗时按 kernel duration 相加，存在并行时不等于请求耗时。完整八卡 CPU / GPU / 标记统计见同目录 operators.csv，CPU 与模块时间为 inclusive。", "", "| Kernel | 次数 | 累计 ms | 平均 μs |", "| --- | ---: | ---: | ---: |"]
         for row in summary["top_gpu_kernels_rank0"][:10]:
@@ -329,6 +331,7 @@ def main():
     parser.add_argument("--decode-graph", action="store_true", help="Capture decode CUDA graphs for exactly the profiled batch sizes")
     parser.add_argument("--hipprof", action="store_true", help="Trace with hipprof (HIP API/kernel/copy) instead of the torch profiler; writes a .pftrace per mode")
     parser.add_argument("--keep-python-functions", action="store_true")
+    parser.add_argument("--mono-only", action="store_true", help="export only Monokernel-related events (fused kernels, device stages, inference/ step markers) to a much smaller merged trace; validation still uses the full per-rank traces")
     parser.add_argument("--kernel-stages", action="store_true", help="embed every measured Monokernel decode step's device-stage spans in the torch-profiler Perfetto trace")
     parser.add_argument("--port", type=int, default=30160)
     parser.add_argument("--url", help="Attach to an existing server with profiling ranges already enabled")
@@ -340,6 +343,8 @@ def main():
     arguments = parser.parse_args()
     if arguments.kernel_stages and (arguments.mode != "monokernel" or arguments.hipprof or arguments.url):
         parser.error("--kernel-stages requires a launched --mode monokernel torch-profiler capture")
+    if arguments.mono_only and (arguments.hipprof or arguments.mode == "native"):
+        parser.error("--mono-only requires a torch-profiler capture (not --hipprof) and --mode monokernel")
     if arguments.url and (arguments.mode == "both" or not arguments.host_event_dir):
         parser.error("Attaching requires one explicit --mode and --host-event-dir")
     if arguments.host_event_dir and not arguments.url:

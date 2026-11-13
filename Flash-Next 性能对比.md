@@ -150,3 +150,81 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --hipprof ...     
 ```
 
 加载模型和预热不会被采集，只采被测的那一次请求。输入 token 和 `profiles/` 下现有三份完全一致。结果是 `<目录>/<模式>/hipprof/<模式>.pftrace`，同样用 Perfetto 打开。
+
+## 三个 profile 工具的区别（11-13 更新）
+
+三个工具都走同一个合并核心 `merge_profiles`，但定位完全不同：要性能数字顺带 trace 用基准脚本；要干净可复现、带核内阶段的深度 trace 用专用采集工具；trace 已抓过只想换种方式重导出用离线重合并工具（不碰 GPU，秒级）。
+
+| 工具 | 定位 | 服务器 | trace 数量 |
+|---|---|---|---|
+| `bench_flash_next.py --profile` | 性能基准跑完后顺手采 trace | 自己拉起或 `--url` 附加，配置即基准配置 | 每个 case 一份 |
+| `tools/profile_flash_next_serving.py` | 专用单次全推理采集，支持 hipprof / 核内阶段 | 自己拉起（或 `--url` 附加），一次采集一个请求 | 每 mode 一份 |
+| `tools/summarize_serving_profile.py` | 对已保存的原始 rank trace 离线重新合并 | 不启动，必须已有 `ranks/*TP-*.trace.json.gz` | 覆盖 / 重建 |
+
+校验（decode 覆盖、8 rank 完整性、token 行数）三者在**完整** trace 上做，只有导出内容受 `mono_only` 影响。
+
+### 用例 1：性能基准 + 顺带 trace（`bench_flash_next.py`）
+
+先跑完全部 timed waves 拿到干净性能数字，然后每个 case 单独 `start_profile → 一轮 wave → stop_profile`。`with_stack` 固定关闭，`--profile` 会拖慢 eager 步（prefill 和不开 graph 的 decode 的 timed 数字也受影响）。
+
+```bash
+# 基准 + 每 case 一份完整 Perfetto trace
+python3 bench_flash_next.py --mode mono --graph --profile \
+  --batch-size 1 --input-len 512 --output-len 64
+
+# 基准 + 精简 trace：只保留融合 kernel、核内阶段、inference/ 步进标记
+python3 bench_flash_next.py --mode mono --graph --profile --profile-mono-only \
+  --batch-size 1 2 --input-len 64 512 2048 --output-len 16 64 128
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--profile` | timed 重复跑完后，每个 case 抓一份 torch-profiler trace（Perfetto `.json.gz`） |
+| `--profile-mono-only` | 配合 `--profile`：导出精简版 `inference.mono_only.json.gz`，约 1% 事件量（b1 512→64 实测 313 MB → 2.3 MB）；丢弃 host / 前端 / client 事件 |
+| `--url` | 附加到已在跑的服务（须已开 `SGLANG_AMD_PROFILE_RANGES=1`） |
+
+输出在 `bench_results/<stamp>/profile/b{batch}_{in}-{out}/` 下，含 `inference.perfetto.json.gz`（或精简版）、`summary.json`、`ranks/`、`host/`。
+
+### 用例 2：专用单次采集（`tools/profile_flash_next_serving.py`）
+
+一次启动只服务一次采集，全程只包裹一个被测请求。可 `--mode both` 依次跑 native + monokernel 做对比。独有能力：`--hipprof`（HIP 层 `.pftrace`）、`--with-stack`、`--kernel-stages`（把核内阶段嵌入 torch trace 时间轴）、`--keep-python-functions`。额外校验：mode 与实际路由匹配、shadow 工作未污染请求、fused 路由 decode 计数与 trace 对齐、tokenize / detokenize host range 必须捕获到。写 `manifest.json` 记录源码 SHA256，保证可复现。
+
+```bash
+# Mono + decode graph + 核内阶段，精简导出
+python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --kernel-stages --mono-only \
+  --input-tokens 512 --output-tokens 64 --batch-size 1 --output-dir <目录>
+
+# native + monokernel 各采一份完整 trace 对比
+python3 tools/profile_flash_next_serving.py --mode both \
+  --input-tokens 512 --output-tokens 64 --output-dir <目录>
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--mono-only` | 合并时只导出 monokernel 相关事件 → `inference.mono_only.json.gz`（校验仍用完整 trace）；要求 torch-profiler 采集且 `--mode monokernel` |
+| `--kernel-stages` | 嵌入每个被测 decode step 的设备端阶段 span；要求自启动的 monokernel torch-profiler 采集 |
+| `--hipprof` | 改用 hipprof 在 HIP 层采集（`.pftrace`），与 `--mono-only` 互斥 |
+| `--with-stack` / `--keep-python-functions` | 保留 python 调用栈 / python 函数事件 |
+| `--mode both` | native 和 monokernel 各启动一次，同目录对比 |
+
+输出在 `<目录>/{native,monokernel}/` 下，含 `inference.perfetto.json.gz`（或精简版）、`operators.csv`、`summary.json`、`manifest.json`、`README.md` 汇总表。
+
+### 用例 3：离线重合并（`tools/summarize_serving_profile.py`）
+
+对用例 2 保存的原始 rank trace 重新合并，不启动服务器、不加载模型。原始 `ranks/*TP-*.trace.json.gz` 一直保留在运行目录里，任何时候都能换一种合并方式重导出。
+
+```bash
+# 从已有运行目录重建精简版 trace（无需重新加载模型）
+python3 tools/summarize_serving_profile.py --run-dir <目录>/monokernel --mono-only
+
+# 重建带 python 函数事件的完整版
+python3 tools/summarize_serving_profile.py --run-dir <目录>/monokernel --keep-python-functions
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--run-dir` | 用例 2 的运行目录（须含 `capture.json` 和 `ranks/*TP-*.trace.json.gz`） |
+| `--mono-only` | 重建成 `inference.mono_only.json.gz` 精简版 |
+| `--keep-python-functions` | 重建成保留 python 函数事件的完整版 |
+
+每次重导出会在 `<run-dir>/postprocess.json` 记录所用 `profile_trace.py` 的源码 SHA256 和选项，之前 summary 里的 shadow 状态、prompt 长度等字段会合并回去。

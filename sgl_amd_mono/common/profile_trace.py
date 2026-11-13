@@ -75,6 +75,21 @@ def _stage_launch_kind(name):
     return None
 
 
+def is_mono_event(event):
+    """True for Monokernel-related trace events: fused kernel launches, embedded device
+    stages, the ``inference/<phase>/step=...`` step markers and the ``mono/...`` fused-object
+    ranges. Used by the ``mono_only`` merge mode to slim the exported Perfetto trace."""
+    category = event.get("cat")
+    name = event.get("name", "")
+    if category in ("mono_kernel", "mono_kernel_stage"):
+        return True
+    if category == "user_annotation":
+        return name.startswith("inference/") or name.startswith("mono/")
+    if category == "kernel":
+        return any(name.startswith(prefix) for prefix in _MONO_KERNEL_PREFIXES.values())
+    return False
+
+
 def _embed_device_stage_events(events, stage_trace, rank):
     """Align one device-stage decode step with its GPU kernels and return Perfetto spans."""
     stage_spans = [event for event in stage_trace.get("traceEvents", [])
@@ -178,7 +193,14 @@ def _embed_device_stage_events(events, stage_trace, rank):
                       "max_launch_start_error_us": max_launch_start_error}
 
 
-def merge_profiles(trace_paths, output, host_directory=None, client_events=(), expected_ranks=8, expected_decode_steps=None, include_python_functions=False, expected_decode_token_rows=None, device_stage_directory=None):
+def merge_profiles(trace_paths, output, host_directory=None, client_events=(), expected_ranks=8, expected_decode_steps=None, include_python_functions=False, expected_decode_token_rows=None, device_stage_directory=None, mono_only=False):
+    """Merge per-rank torch-profiler traces into one Perfetto-compatible trace.
+
+    With ``mono_only=True`` the input traces are still fully validated (GPU kernels present,
+    DECODE/prefill coverage, expected steps/rows, rank set), but the merged output and
+    operators.csv keep only Monokernel-related events: fused kernel launches, embedded device
+    stage spans, the ``inference/<phase>/step`` markers and the ``mono/`` fused-object ranges.
+    Host/frontend/client events are dropped entirely."""
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".partial")
@@ -253,12 +275,13 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
                 raise ValueError(f"Rank {rank} decode coverage mismatch: {phases['DECODE']['forwards']} != {expected_decode_steps}")
             if expected_decode_token_rows is not None and phases["DECODE"]["batch_rows"] != expected_decode_token_rows:
                 raise ValueError(f"Rank {rank} decode token coverage mismatch: {phases['DECODE']['batch_rows']} != {expected_decode_token_rows}")
-            rank_summaries.append({"rank": rank, "source": str(path), "events": len(events), "categories": dict(categories), "phases": phases, "unattributed_gpu_kernels": unmatched, "python_function_events_filtered": 0 if include_python_functions else categories["python_function"]})
-            operators.extend(_operator_rows(events, rank))
+            rank_events = [event for event in events if is_mono_event(event)] if mono_only else events
+            rank_summaries.append({"rank": rank, "source": str(path), "events": len(events), "events_kept_mono_only": len(rank_events), "categories": dict(categories), "phases": phases, "unattributed_gpu_kernels": unmatched, "python_function_events_filtered": 0 if include_python_functions else categories["python_function"]})
+            operators.extend(_operator_rows(rank_events, rank))
             process_names = {str(event.get("pid")): event.get("args", {}).get("name") for event in events if event.get("name") == "process_name"}
-            for process in dict.fromkeys(str(event.get("pid", 0)) for event in events):
+            for process in dict.fromkeys(str(event.get("pid", 0)) for event in rank_events):
                 emit({"ph": "M", "name": "process_name", "pid": identity("pid", rank, process), "tid": 0, "args": {"name": f"TP{rank} / {process_names.get(process) or process}"}})
-            for original in events:
+            for original in rank_events:
                 if not include_python_functions and original.get("cat") == "python_function":
                     continue
                 event = dict(original)
@@ -305,19 +328,25 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
                 operators.extend(_operator_rows(embedded, rank))
         if seen_ranks != set(range(expected_ranks)):
             raise ValueError(f"Expected TP ranks 0..{expected_ranks - 1}, found {sorted(seen_ranks)}")
-        host_events = list(client_events)
+        # mono_only drops host/frontend/client events from the exported trace, but the files are
+        # still read and host_ranges still counted so capture-completeness checks keep working.
+        host_events = [] if mono_only else list(client_events)
         if host_directory is not None:
             for path in sorted(Path(host_directory).glob("host-*.jsonl")):
                 with path.open() as source:
                     host_events.extend(json.loads(line) for line in source if line.strip())
-        for process in dict.fromkeys(event["pid"] for event in host_events):
-            emit({"ph": "M", "name": "process_name", "pid": identity("pid", "host", process), "tid": 0, "args": {"name": f"Request / frontend / PID {process}"}})
+        if not mono_only:
+            for process in dict.fromkeys(event["pid"] for event in host_events):
+                emit({"ph": "M", "name": "process_name", "pid": identity("pid", "host", process), "tid": 0, "args": {"name": f"Request / frontend / PID {process}"}})
         for original in host_events:
             event = dict(original)
             event["pid"] = identity("pid", "host", original["pid"])
             event["tid"] = identity("tid", "host", (original["pid"], original.get("tid", 0)))
             event["ts"] -= common_base / 1000
             host_names[event["name"]] += 1
+            if mono_only:
+                continue  # counted for the summary / capture checks, but not exported
+            emit(event)
             emit(event)
         flush()
         destination.write(('],"baseTimeNanoseconds":' + str(common_base) + "}").encode())
@@ -331,6 +360,8 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
     timing_note = "GPU totals sum kernel durations and can overlap; CPU and module durations are inclusive. Embedded TP peer waits remain inside fused kernel durations."
     if device_stage_directory is not None:
         timing_note += " mono_kernel_stage spans are device wall-clock measurements aligned to the corresponding torch GPU kernel launch."
-    summary = {"format": "Chrome Trace Event JSON gzip; Perfetto compatible", "trace": str(output), "operators_csv": str(csv_path), "total_events": total_events, "python_functions_in_merged_trace": include_python_functions, "ranks": rank_summaries, "host_ranges": dict(host_names), "device_kernel_stages": stage_capture if device_stage_directory is not None else None, "timing_note": timing_note, "top_gpu_kernels_rank0": [row for row in operators if row["rank"] == 0 and row["category"] == "kernel"][:30]}
+    if mono_only:
+        timing_note += " mono_only: host/frontend/client events were dropped; only Monokernel-related events were exported (validation still used the full traces)."
+    summary = {"format": "Chrome Trace Event JSON gzip; Perfetto compatible", "trace": str(output), "operators_csv": str(csv_path), "total_events": total_events, "mono_only": mono_only, "python_functions_in_merged_trace": include_python_functions, "ranks": rank_summaries, "host_ranges": dict(host_names), "device_kernel_stages": stage_capture if device_stage_directory is not None else None, "timing_note": timing_note, "top_gpu_kernels_rank0": [row for row in operators if row["rank"] == 0 and row["category"] == "kernel"][:30]}
     output.with_name("summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     return summary

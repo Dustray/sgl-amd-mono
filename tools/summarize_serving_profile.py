@@ -10,6 +10,7 @@ def main():
     parser = argparse.ArgumentParser(description="Rebuild full inference traces and operator tables from saved per-rank profiles")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--keep-python-functions", action="store_true")
+    parser.add_argument("--mono-only", action="store_true", help="rebuild the merged trace with only Monokernel-related events (fused kernels, device stages, inference/ step markers); host/frontend/client events are dropped")
     arguments = parser.parse_args()
     root = arguments.run_dir.resolve()
     directories = [root] if (root / "capture.json").exists() else [root / mode for mode in ("native", "monokernel") if (root / mode / "capture.json").exists()]
@@ -24,7 +25,8 @@ def main():
         batch_size = len(capture["inputs"])
         summary_path = directory / "summary.json"
         previous = json.loads(summary_path.read_text()) if summary_path.exists() else {}
-        summary = merge_profiles(list((directory / "ranks").glob("*TP-*.trace.json.gz")), directory / "inference.perfetto.json.gz", directory / "host", clients, expected_decode_steps=capture["output_tokens"] - 1 if batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=batch_size * (capture["output_tokens"] - 1))
+        trace_name = "inference.mono_only.json.gz" if arguments.mono_only else "inference.perfetto.json.gz"
+        summary = merge_profiles(list((directory / "ranks").glob("*TP-*.trace.json.gz")), directory / trace_name, directory / "host", clients, expected_decode_steps=capture["output_tokens"] - 1 if batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=batch_size * (capture["output_tokens"] - 1), mono_only=arguments.mono_only)
         for key in ("shadow_state_before", "shadow_state_after", "profile_is_accuracy_acceptance", "prompt_tokens", "output_tokens", "batch_size"):
             if key in previous:
                 summary[key] = previous[key]
@@ -32,7 +34,7 @@ def main():
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
         source = Path(__file__).resolve().parents[1] / "sgl_amd_mono/common/profile_trace.py"
         manifest = root / "manifest.json" if (root / "manifest.json").exists() else root.parent / "manifest.json"
-        (directory / "postprocess.json").write_text(json.dumps({"source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "include_python_functions": arguments.keep_python_functions, "capture_source_manifest": str(manifest)}, indent=2) + "\n")
+        (directory / "postprocess.json").write_text(json.dumps({"source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "include_python_functions": arguments.keep_python_functions, "mono_only": arguments.mono_only, "capture_source_manifest": str(manifest)}, indent=2) + "\n")
         print(f"{directory.name}: {summary['total_events']} events -> {summary['trace']}", flush=True)
 
 

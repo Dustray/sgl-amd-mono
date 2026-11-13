@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import gzip
 import json
 from pathlib import Path
@@ -69,6 +70,54 @@ def test_merge_rejects_incomplete_capture(tmp_path, failure):
     with pytest.raises(ValueError):
         merge_profiles([path, path] if failure == "duplicate_rank" else [path], tmp_path / "merged.json.gz", expected_ranks=2 if failure == "missing_rank" else 1, expected_decode_steps=2 if failure == "decode_coverage" else 1, expected_decode_token_rows=2 if failure == "decode_token_coverage" else 1)
     assert not (tmp_path / "merged.json.gz").exists()
+
+
+def test_merge_mono_only_keeps_only_monokernel_events(tmp_path):
+    from sgl_amd_mono.common.profile_trace import is_mono_event
+
+    # The rank_trace helper has no fused kernels; add mono-style events to rank 0.
+    paths = [rank_trace(tmp_path, rank) for rank in range(2)]
+    trace = read_trace(paths[0])
+    trace["traceEvents"].extend([
+        {"ph": "X", "cat": "kernel", "name": "gdn_attention(GDNArguments)", "pid": 1, "tid": 0, "ts": 220, "dur": 12, "args": {"correlation": 43}},
+        {"ph": "X", "cat": "kernel", "name": "decode_entry(EntryArguments)", "pid": 1, "tid": 0, "ts": 205, "dur": 5, "args": {"correlation": 44}},
+        {"ph": "X", "cat": "user_annotation", "name": "mono/layer.00/gdn", "pid": 2, "tid": 3, "ts": 200, "dur": 50},
+        {"ph": "X", "cat": "user_annotation", "name": "module/model.layers.0:GDN", "pid": 2, "tid": 3, "ts": 200, "dur": 50},
+        {"ph": "X", "cat": "cuda_runtime", "name": "hipLaunchKernel", "pid": 2, "tid": 3, "ts": 205, "dur": 2, "args": {"correlation": 43}},
+    ])
+    with gzip.open(paths[0], "wt") as output:
+        json.dump(trace, output)
+    host = tmp_path / "host"
+    host.mkdir()
+    (host / "host-1.jsonl").write_text(json.dumps({"ph": "X", "cat": "frontend", "name": "_tokenize_texts", "pid": 1, "tid": 0, "ts": 1000000, "dur": 5}) + "\n")
+    client = [{"ph": "X", "cat": "client", "name": "HTTP", "pid": 1, "tid": 0, "ts": 1000210, "dur": 20}]
+    summary = merge_profiles(paths, tmp_path / "mono.json.gz", host, client_events=client, expected_ranks=2, expected_decode_steps=1, mono_only=True)
+    events = read_trace(tmp_path / "mono.json.gz")["traceEvents"]
+    timed = [event for event in events if event.get("ph") == "X"]
+    categories = {event.get("cat") for event in timed}
+    # Only mono-related categories survive: fused kernels + inference/ step markers; no host/client/aten events.
+    # (ph=="M" process_name metadata events are still emitted for Perfetto.)
+    assert categories == {"kernel", "user_annotation"}
+    names = {event["name"] for event in timed}
+    assert {"gdn_attention(GDNArguments)", "decode_entry(EntryArguments)", "mono/layer.00/gdn",
+            "inference/EXTEND/step=1/batch=1", "inference/DECODE/step=2/batch=1"} <= names
+    assert not any(name.startswith("module/") or name == "HTTP" or name == "_tokenize_texts" or name == "actual_gpu_kernel"
+                   for name in names)
+    assert summary["mono_only"] is True
+    assert summary["ranks"][0]["events_kept_mono_only"] == 5  # 2 fused kernels + 3 inference/mono annotations
+    assert summary["ranks"][1]["events_kept_mono_only"] == 2  # EXTEND + DECODE step markers only
+    # Host ranges are still counted (for capture-completeness checks) but not exported.
+    assert summary["host_ranges"] == {"_tokenize_texts": 1}
+    # Validation still ran on the full traces: phase GPU totals were computed from every kernel event,
+    # including the non-mono actual_gpu_kernel (20) and the mono gdn_attention (12).
+    assert summary["ranks"][0]["phases"]["DECODE"]["gpu_kernel_us"] == 32
+    rows = list(csv.DictReader((tmp_path / "operators.csv").open()))
+    assert {row["name"] for row in rows if row["rank"] == "0"} == {"gdn_attention(GDNArguments)", "decode_entry(EntryArguments)",
+                                                                   "inference/EXTEND/step=1/batch=1", "inference/DECODE/step=2/batch=1",
+                                                                   "mono/layer.00/gdn"}
+    assert is_mono_event({"cat": "mono_kernel_stage", "name": "mix.down"})
+    assert is_mono_event({"cat": "user_annotation", "name": "inference/DECODE/step=3/batch=2"})
+    assert not is_mono_event({"cat": "cpu_op", "name": "aten::mm"})
 
 
 def test_device_stages_align_to_fused_torch_kernels():

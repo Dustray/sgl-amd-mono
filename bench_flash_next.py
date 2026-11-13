@@ -285,7 +285,7 @@ def wave(url, inputs, output_len):
 # ---------------------------------------------------------------- profile
 
 
-def profile_case(url, directory, event_directory, inputs, output_len, expected_decode_steps):
+def profile_case(url, directory, event_directory, inputs, output_len, expected_decode_steps, mono_only=False):
     from sgl_amd_mono.common.profile_trace import merge_profiles
 
     directory.mkdir(parents=True)
@@ -310,10 +310,11 @@ def profile_case(url, directory, event_directory, inputs, output_len, expected_d
         events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         (directory / "host" / path.name).write_text("".join(json.dumps(event) + "\n" for event in events if window_start <= event["ts"] <= window_end))
     traces = sorted((directory / "ranks").glob("*TP-*.trace.json.gz"))
-    summary = merge_profiles(traces, directory / "inference.perfetto.json.gz", directory / "host", (), expected_ranks=8,
-                             expected_decode_steps=expected_decode_steps, expected_decode_token_rows=len(inputs) * (output_len - 1))
+    name = "inference.mono_only.json.gz" if mono_only else "inference.perfetto.json.gz"
+    summary = merge_profiles(traces, directory / name, directory / "host", (), expected_ranks=8,
+                             expected_decode_steps=expected_decode_steps, expected_decode_token_rows=len(inputs) * (output_len - 1), mono_only=mono_only)
     save(directory / "summary.json", summary)
-    return {"trace": str(directory / "inference.perfetto.json.gz"), "events": summary["total_events"], "wall_s": measured["wall_s"]}
+    return {"trace": str(directory / name), "events": summary["total_events"], "wall_s": measured["wall_s"]}
 
 
 # ---------------------------------------------------------------- statistics / report
@@ -381,6 +382,7 @@ def parse_arguments():
     parser.add_argument("--mode", choices=("native", "mono"), required=True, help="decode path: native SGLang or Flash-Next Monokernel")
     parser.add_argument("--graph", action="store_true", help="capture decode CUDA graphs for exactly the requested batch sizes (no padding)")
     parser.add_argument("--profile", action="store_true", help="after the timed repeats, capture one torch-profiler trace per case (Perfetto .json.gz); slows eager steps of the timed runs too")
+    parser.add_argument("--profile-mono-only", action="store_true", help="with --profile: export only Monokernel-related events (fused kernels, device stages, inference/ step markers) to a much smaller trace; host/frontend/client events are dropped")
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1], help="concurrent requests per wave (mono supports 1 and 2)")
     parser.add_argument("--input-len", type=int, nargs="+", default=[512], help="prompt tokens per request")
     parser.add_argument("--output-len", type=int, nargs="+", default=[64], help="generated tokens per request (ignore_eos)")
@@ -399,6 +401,8 @@ def parse_arguments():
     parser.add_argument("server_args", nargs=argparse.REMAINDER, help="extra sglang.launch_server arguments after '--'")
     arguments = parser.parse_args()
     arguments.server_args = arguments.server_args[1:] if arguments.server_args[:1] == ["--"] else arguments.server_args
+    if arguments.profile_mono_only and not arguments.profile:
+        parser.error("--profile-mono-only requires --profile")
     if arguments.mode == "mono" and not set(arguments.batch_size) <= set(MONO_BATCH_SIZES):
         parser.error("mono decode supports batch sizes 1 and 2")
     if min(arguments.batch_size) < 1 or min(arguments.input_len) < 1 or min(arguments.output_len) < 2:
@@ -459,7 +463,7 @@ def main():
             summary = summarize((batch, input_len, output_len), waves)
             summary["mono_audit"] = audit
             if arguments.profile:
-                summary["profile"] = profile_case(url, directory / "profile" / f"b{batch}_{input_len}-{output_len}", directory / "profile_events", prompts, output_len, output_len - 1 if batch == 1 else None)
+                summary["profile"] = profile_case(url, directory / "profile" / f"b{batch}_{input_len}-{output_len}", directory / "profile_events", prompts, output_len, output_len - 1 if batch == 1 else None, mono_only=arguments.profile_mono_only)
                 print(f"{label}: trace {summary['profile']['trace']}", flush=True)
             summaries.append(summary)
             report["cases"].append({**summary, "samples": [{key: value for key, value in item.items() if key != "requests"} | {"requests": [{key: value for key, value in request.items() if key != "output_ids"} for request in item["requests"]]} for item in waves]})
