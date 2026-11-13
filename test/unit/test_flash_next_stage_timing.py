@@ -22,6 +22,8 @@ def record_stream(step_count=2):
             records.append((START_STAGE[kind], clock))
             for stage in SEGMENTS[kind]:
                 clock += 100
+                records.append((stage + 1000, clock))
+                clock += 100
                 records.append((stage, clock))
     return records
 
@@ -78,8 +80,13 @@ def test_export_layout(tmp_path):
     assert steps[0]["ts"] + steps[0]["dur"] <= steps[1]["ts"]
     assert result["steps"] == 2 and not result["dropped"]
     final_layer = next(event for event in spans if event["name"] == "layer 1 qsa")
+    final_post = next(event for event in spans if event["name"] == "layer 1 qsa+post")
     tail = next(event for event in spans if event["name"] == "tail")
-    assert final_layer["ts"] + final_layer["dur"] == tail["ts"]
+    assert final_layer["ts"] + final_layer["dur"] == final_post["ts"] + final_post["dur"]
+    assert final_layer["ts"] + final_layer["dur"] < tail["ts"]
+    # Layer start is the attention kernel's entry mark, not the preceding kernel's end.
+    qsa_launch = next(launch for launch in launches(records) if launch["kind"] == "qsa")
+    assert final_layer["ts"] == pytest.approx((qsa_launch["marks"][0][1] - int(records[0, 1])) / 1000)
     # Every launch's first mark opens the launch span, so it is not a segment of its own.
     launches_per_step = 9
     assert len(result["segments"]) == len(records) - launches_per_step * 2
@@ -87,6 +94,10 @@ def test_export_layout(tmp_path):
     # 100 ticks at 1 GHz = 0.1 us; the check pins the tick->time conversion.
     first_segment = next(event for event in spans if event["name"] == "mix.normalize")
     assert first_segment["dur"] == pytest.approx(0.1, rel=1e-6)
+    first_wait = next(event for event in spans if event["name"] == "mix.normalize / block 0 grid wait")
+    assert first_wait["dur"] == pytest.approx(0.1, rel=1e-6)
+    assert first_segment["ts"] + first_segment["dur"] == pytest.approx(first_wait["ts"])
+    assert first_wait["args"]["depth"] == 4
 
 
 def test_zero_length_spans_are_dropped(tmp_path):

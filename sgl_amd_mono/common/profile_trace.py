@@ -112,6 +112,8 @@ def _embed_device_stage_events(events, stage_trace, rank):
                          f"stage launches={dict(expected)}, profiled kernels={dict(actual)}")
 
     pairs = list(zip(launch_spans, fused_kernels[match_start:match_start + launch_count]))
+    pairs_by_launch = {id(stage_launch): (stage_launch, kernel) for stage_launch, kernel in pairs}
+    launch_starts = [stage_launch["ts"] for stage_launch, _ in pairs]
     first_stage, first_kernel = pairs[0]
     global_offset = first_kernel["ts"] - first_stage["ts"]
     embedded = []
@@ -139,16 +141,19 @@ def _embed_device_stage_events(events, stage_trace, rank):
         depth = original.get("args", {}).get("depth", 0)
         parent = None
         if depth == 2:
-            parent = next((pair for pair in pairs if pair[0] is original), None)
+            parent = pairs_by_launch.get(id(original))
             if parent is None:
                 raise ValueError(f"Unmatched device-stage launch for rank {rank}")
-        elif depth == 3:
-            parent = next((pair for pair in pairs
-                           if pair[0]["ts"] <= original["ts"] <= pair[0]["ts"] + pair[0]["dur"]), None)
+        elif depth in (3, 4):
+            index = bisect_right(launch_starts, original["ts"]) - 1
+            if index >= 0:
+                candidate = pairs[index]
+                if original["ts"] <= candidate[0]["ts"] + candidate[0]["dur"]:
+                    parent = candidate
 
         event = dict(original)
-        event["cat"] = "mono_kernel_stage" if depth == 3 else "mono_kernel"
-        if depth == 3 and parent is not None:
+        event["cat"] = "mono_kernel_stage" if depth in (3, 4) else "mono_kernel"
+        if depth in (3, 4) and parent is not None:
             layer_index, module = launch_contexts[id(parent[0])]
             event["name"] = f"layer {layer_index:02d} {module} / {original['name']}" if layer_index is not None else f"{module} / {original['name']}"
         event["args"] = {**original.get("args", {}), "tp_rank": rank}
@@ -281,11 +286,14 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
                 stage_pid = identity("pid", rank, stage_summary["pid"])
                 stage_tid = identity("tid", rank, (stage_summary["pid"], "monokernel-device-stages"))
                 emit({"ph": "M", "name": "thread_name", "pid": stage_pid, "tid": stage_tid,
-                      "args": {"name": f"Monokernel internal stages / TP{rank} / device clock"}})
+                      "args": {"name": f"Monokernel internal stages / compute / TP{rank} / device clock"}})
+                wait_tid = identity("tid", rank, (stage_summary["pid"], "monokernel-grid-waits"))
+                emit({"ph": "M", "name": "thread_name", "pid": stage_pid, "tid": wait_tid,
+                      "args": {"name": f"Monokernel block 0 grid waits / TP{rank} / device clock"}})
                 for event in embedded:
                     process = event["pid"]
                     event["pid"] = identity("pid", rank, process)
-                    event["tid"] = stage_tid
+                    event["tid"] = wait_tid if event.get("args", {}).get("depth") == 4 else stage_tid
                     event["ts"] += (base - common_base) / 1000
                     emit(event)
                 stage_capture["ranks"].append(rank)

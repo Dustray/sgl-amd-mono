@@ -85,6 +85,7 @@ def test_device_stages_align_to_fused_torch_kernels():
         {"ph": "X", "cat": "stage", "name": "layer 0 gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 30, "args": {"depth": 1}},
         {"ph": "X", "cat": "stage", "name": "gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 20, "args": {"depth": 2}},
         {"ph": "X", "cat": "stage", "name": "mix.down", "pid": 0, "tid": 1, "ts": 21, "dur": 3, "args": {"depth": 3}},
+        {"ph": "X", "cat": "stage", "name": "mix.down / block 0 grid wait", "pid": 0, "tid": 1, "ts": 24, "dur": 2, "args": {"depth": 4}},
         {"ph": "X", "cat": "stage", "name": "layer 0 gdn+post", "pid": 0, "tid": 1, "ts": 45, "dur": 30, "args": {"depth": 2}},
         {"ph": "X", "cat": "stage", "name": "tail", "pid": 0, "tid": 1, "ts": 80, "dur": 20, "args": {"depth": 2}},
     ]
@@ -99,8 +100,11 @@ def test_device_stages_align_to_fused_torch_kernels():
     )
     entry = next(event for event in embedded if event["name"] == "entry")
     segment = next(event for event in embedded if event["name"] == "layer 00 gdn / mix.down")
+    wait = next(event for event in embedded if event["name"] == "layer 00 gdn / mix.down / block 0 grid wait")
     assert entry["ts"] == 100 and entry["dur"] == 10 and entry["tid"] == 10
     assert segment["ts"] == 121 and segment["dur"] == 3 and segment["args"]["kernel_correlation"] == 2
+    assert wait["ts"] == 124 and wait["dur"] == 2 and wait["tid"] == 10
+    assert wait["cat"] == "mono_kernel_stage" and wait["args"]["depth"] == 4
     assert summary == {"steps": 2, "launches": 8, "spans": len(stage_spans) * 2, "pid": 1, "tid": 10,
                        "max_launch_start_error_us": 0}
 
@@ -119,6 +123,7 @@ def test_merge_embeds_device_stages_on_named_tracks(tmp_path):
         {"ph": "X", "cat": "stage", "name": "layer 0 gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 30, "args": {"depth": 1}},
         {"ph": "X", "cat": "stage", "name": "gdn", "pid": 0, "tid": 1, "ts": 20, "dur": 20, "args": {"depth": 2}},
         {"ph": "X", "cat": "stage", "name": "mix.down", "pid": 0, "tid": 1, "ts": 21, "dur": 3, "args": {"depth": 3}},
+        {"ph": "X", "cat": "stage", "name": "mix.down / block 0 grid wait", "pid": 0, "tid": 1, "ts": 24, "dur": 2, "args": {"depth": 4}},
         {"ph": "X", "cat": "stage", "name": "layer 0 gdn+post", "pid": 0, "tid": 1, "ts": 45, "dur": 30, "args": {"depth": 2}},
         {"ph": "X", "cat": "stage", "name": "tail", "pid": 0, "tid": 1, "ts": 80, "dur": 20, "args": {"depth": 2}},
     ]
@@ -151,7 +156,13 @@ def test_merge_embeds_device_stages_on_named_tracks(tmp_path):
     assert entry_span["tid"] != entry_kernel["tid"]
     track = next(event for event in events if event.get("ph") == "M" and event.get("name") == "thread_name"
                  and event.get("pid") == entry_span["pid"] and event.get("tid") == entry_span["tid"])
-    assert "Monokernel internal stages" in track["args"]["name"]
+    assert "Monokernel internal stages / compute" in track["args"]["name"]
+    wait_span = next(event for event in events if event.get("cat") == "mono_kernel_stage"
+                     and event.get("name") == "layer 00 gdn / mix.down / block 0 grid wait")
+    wait_track = next(event for event in events if event.get("ph") == "M" and event.get("name") == "thread_name"
+                      and event.get("pid") == wait_span["pid"] and event.get("tid") == wait_span["tid"])
+    assert wait_span["tid"] != entry_span["tid"]
+    assert "block 0 grid waits" in wait_track["args"]["name"]
     assert summary["device_kernel_stages"]["ranks"] == [0, 1]
     assert summary["device_kernel_stages"]["steps"] == 2
     assert summary["device_kernel_stages"]["launches"] == 16

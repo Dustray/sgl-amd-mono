@@ -95,7 +95,7 @@ __device__ __forceinline__ float wave_sum(float value) {
 }
 
 // Device-side stage timing. The host attaches one int64 buffer per rank; grid_sync records
-// (stage, wall_clock64()) at every barrier, so consecutive records bound one stage of one kernel.
+// the block-0 arrival and release timestamps for each barrier.
 // Layout: [0] cursor, [1] dropped flag, [2 + 2n] = stage, [3 + 2n] = ticks.
 __device__ int64_t* stage_buffer = nullptr;
 __device__ int64_t stage_capacity = 0;
@@ -115,6 +115,7 @@ __device__ __forceinline__ void stage_mark(unsigned int stage) {
 
 __device__ __forceinline__ bool grid_sync(unsigned int* state, int64_t timeout, unsigned int stage) {
     __shared__ int success;
+    stage_mark(stage + 1000);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {

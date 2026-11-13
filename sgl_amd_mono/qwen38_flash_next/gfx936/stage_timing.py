@@ -1,8 +1,8 @@
 """Device-side stage timing for the Flash-Next kernels.
 
-Every kernel marks `wall_clock64()` at each grid barrier (`kernel.cpp:stage_mark`), tagged with
-the barrier's stage number. Stage numbers are unique per kernel kind, so a flat record stream is
-enough to rebuild which stage of which launch ran when:
+Every grid barrier records block 0's arrival and release timestamps (`kernel.cpp:grid_sync`).
+Stage numbers are unique per kernel kind, so a flat record stream is enough to rebuild which
+stage of which launch ran when. Compute and block-0 grid-wait intervals use separate tracks:
 
 | stage | kernel | stage | kernel |
 |---|---|---|---|
@@ -13,7 +13,8 @@ enough to rebuild which stage of which launch ran when:
 
 The host allocates one buffer per rank and attaches it to every compiled library (each `.so`
 has its own copy of the device symbol because it includes `kernel.cpp`). Records are
-`(stage, ticks)` pairs after a 2-slot header: `[0]` cursor, `[1]` dropped flag.
+`(stage, ticks)` pairs after a 2-slot header: `[0]` cursor, `[1]` dropped flag. Barrier-arrival
+records encode their stage as `stage + SYNC_ARRIVAL_OFFSET`.
 """
 
 import ctypes
@@ -33,6 +34,7 @@ KINDS = (
     ("tail", 630, 649),
 )
 START_STAGE = {"hc_mix": 700, "post": 701, "gdn": 702, "qsa": 703, "ple": 704, "entry": 705, "tail": 706}
+SYNC_ARRIVAL_OFFSET = 1000
 
 # The barrier a segment *ends* at names the work done before it.
 SEGMENTS = {
@@ -60,6 +62,8 @@ SEGMENTS = {
 
 
 def kind_of(stage):
+    if stage >= SYNC_ARRIVAL_OFFSET:
+        stage -= SYNC_ARRIVAL_OFFSET
     for name, start in START_STAGE.items():
         if stage == start:
             return name
@@ -143,7 +147,7 @@ def launches(records):
 
 
 def export_trace(records, path, clock_khz, rank, dropped=False, labels=None):
-    """Write one rank's stages as a Perfetto (Chrome Trace) file: step -> layer kernel -> segment."""
+    """Write one rank's stages as a Perfetto trace: step -> layer -> kernel -> segment."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     events = [{"ph": "M", "name": "process_name", "pid": rank, "tid": 0, "args": {"name": f"rank {rank} (device stages)"}},
@@ -164,24 +168,43 @@ def export_trace(records, path, clock_khz, rank, dropped=False, labels=None):
             step_open = {"start": first, "step": step}
             layer_open = None
         if launch["kind"] in ("gdn", "qsa"):
-            if layer_open is not None:
-                events.append(_span(rank, 1, f"layer {layer} {layer_open['kind']}", layer_open["start"], first, base, ticks_per_us))
             layer += 1
             layer_open = {"kind": launch["kind"], "start": first}
         label = f"{launch['kind']}"
         if launch["kind"] == "post" and layer_open is not None:
             label = f"layer {layer} {layer_open['kind']}+post"
         events.append(_span(rank, 1, label, first, last, base, ticks_per_us, depth_extra=2))
+        if launch["kind"] == "post" and layer_open is not None:
+            events.append(_span(rank, 1, f"layer {layer} {layer_open['kind']}",
+                                layer_open["start"], last, base, ticks_per_us))
+            layer_open = None
         previous = first
-        for stage, ticks in marks[1:]:
+        index = 1
+        while index < len(marks):
+            stage, ticks = marks[index]
+            if stage >= SYNC_ARRIVAL_OFFSET and index + 1 < len(marks):
+                barrier_stage = stage - SYNC_ARRIVAL_OFFSET
+                release_stage, release_ticks = marks[index + 1]
+                if release_stage == barrier_stage:
+                    name = segment_name(launch["kind"], barrier_stage)
+                    events.append(_span(rank, 1, name, previous, ticks, base, ticks_per_us, depth_extra=3))
+                    events.append(_span(rank, 1, f"{name} / block 0 grid wait", ticks, release_ticks,
+                                        base, ticks_per_us, depth_extra=4))
+                    summary.extend((
+                        {"kind": launch["kind"], "stage": barrier_stage, "segment": name, "phase": "compute",
+                         "us": (ticks - previous) / ticks_per_us},
+                        {"kind": launch["kind"], "stage": barrier_stage, "segment": name, "phase": "block0_grid_wait",
+                         "us": (release_ticks - ticks) / ticks_per_us},
+                    ))
+                    previous = release_ticks
+                    index += 2
+                    continue
             events.append(_span(rank, 1, segment_name(launch["kind"], stage), previous, ticks, base, ticks_per_us, depth_extra=3))
             summary.append({"kind": launch["kind"], "stage": stage, "segment": segment_name(launch["kind"], stage),
-                            "us": (ticks - previous) / ticks_per_us})
+                            "phase": "legacy", "us": (ticks - previous) / ticks_per_us})
             previous = ticks
+            index += 1
         if launch["kind"] == "tail":
-            if layer_open is not None:
-                events.append(_span(rank, 1, f"layer {layer} {layer_open['kind']}", layer_open["start"], first, base, ticks_per_us))
-                layer_open = None
             if step_open is not None:
                 events.append(_span(rank, 1, f"step {step}", step_open["start"], last, base, ticks_per_us))
                 step_open = None

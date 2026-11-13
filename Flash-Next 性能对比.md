@@ -125,6 +125,7 @@ python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime
 ```
 
 只采指定的第 5 个 fused decode step（可改），并覆盖 kernel 入口到末尾的所有阶段；eager 和 decode graph 都支持。八张卡分别记录设备端时间，合并后导出 `<运行目录>/runtime/stage-timing.perfetto.json` 和各阶段耗时汇总。粒度到混音、投影、卷积、稀疏注意力选块、路由、专家、两处 all-reduce 等待等。
+kernel 入口时间由 kernel 内的设备端标记记录；`layer gdn/qsa` 从 attention kernel 的入口标记开始，在对应的 `post` kernel 最后一个 barrier 结束，不再用下一个 attention kernel 的开始时间代替结束时间。核内阶段现在拆成 block 0 到达下一 grid barrier 前的计算区间，以及单独轨道上的 `block 0 grid wait`；后者是 block 0 等待整个 grid 汇合的时间，不等于 GPU 全卡空闲时间。
 
 要把每一步 decode 的核内阶段直接放进完整 torch-profiler trace（与 GPU kernel 同一时间轴），用全量采集工具：
 
