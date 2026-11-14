@@ -98,10 +98,13 @@ class FlashRuntime:
         self.tail.state = self.peers.state
         self.io = DecodeIO(runner.model, self.tail, self.peers)
         self.stage_timing = None
+        self.cu_timing = None
         self._validate_communication()
         self._validate_weights()
         if os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING", "0") == "1":
             self._attach_stage_timing()
+        if os.environ.get("SGLANG_AMD_FLASH_CU_TIMING", "0") == "1":
+            self._attach_cu_timing()
         self.counter_offsets = self.execution_counts()
         for layer_id, layer in enumerate(self.model.layers):
             self._wrap_layer(layer_id, layer)
@@ -114,17 +117,30 @@ class FlashRuntime:
 
         records = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_RECORDS", str(1 << 18)))
         timing = StageTiming(self.device, self.rank, records)
-        programs = {id(self.peers.program): self.peers.program, id(self.io.program): self.io.program}
-        for module in (*self.mixers, *self.posts, *self.ple):
-            if module is not None:
-                programs[id(module.program)] = module.program
-        for module in (*self.gdn, *self.qsa):
-            if module is not None:
-                programs[id(module.program)] = module.program
-        for program in programs.values():
+        for program in self._timed_programs().values():
             timing.attach(program)
         self.stage_timing = timing
-        logger.info("AMD_FLASH_STAGE_TIMING attached to %s libraries on rank %s, %s records", len(programs), self.rank, records)
+        logger.info("AMD_FLASH_STAGE_TIMING attached to %s libraries on rank %s, %s records", len(timing.libraries), self.rank, records)
+
+    def _attach_cu_timing(self):
+        from .cu_timing import CUTiming
+
+        records = int(os.environ.get("SGLANG_AMD_FLASH_CU_TIMING_RECORDS", str(1 << 13)))
+        blocks = int(self.peers.program.manifest.get("blocks", 80))
+        timing = CUTiming(self.device, self.rank, records, blocks)
+        for program in self._timed_programs().values():
+            timing.attach(program)
+        self.cu_timing = timing
+        logger.info("AMD_FLASH_CU_TIMING attached to %s libraries on rank %s, %s blocks x %s records (%.1f MiB)",
+                    len(timing.libraries), self.rank, blocks, records, timing.capacity * 8 / 2 ** 20)
+
+    def _timed_programs(self):
+        """Every distinct compiled library: each includes kernel.cpp and so has its own symbols."""
+        programs = {id(self.peers.program): self.peers.program, id(self.io.program): self.io.program}
+        for module in (*self.mixers, *self.posts, *self.ple, *self.gdn, *self.qsa):
+            if module is not None:
+                programs[id(module.program)] = module.program
+        return programs
 
     def export_stage_timing(self, label="decode"):
         if self.stage_timing is None:
@@ -132,22 +148,39 @@ class FlashRuntime:
         clock_khz = self.peers.program.information.get("clock_khz")
         return self.stage_timing.export(self.report_dir / f"stage-timing-{label}-rank-{self.rank}.json", clock_khz)
 
+    def export_cu_timing(self, label="decode", base=None):
+        if self.cu_timing is None:
+            raise FlashContractError("Flash-Next CU timing is not enabled")
+        clock_khz = self.peers.program.information.get("clock_khz")
+        return self.cu_timing.export(self.report_dir / f"cu-timing-{label}-rank-{self.rank}.json", clock_khz, base)
+
     def begin_stage_timing_step(self):
-        if self.stage_timing is None:
-            return
         step = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_STEP", "0"))
-        if step > 0 and self.completed_decode_steps + 1 == step:
+        if step <= 0 or self.completed_decode_steps + 1 != step:
+            return
+        if self.stage_timing is not None:
             self.stage_timing.reset()
+        if self.cu_timing is not None:
+            self.cu_timing.reset()
 
     def finish_stage_timing_step(self):
-        if self.stage_timing is None:
+        if self.stage_timing is None and self.cu_timing is None:
             return
         first_step = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_STEP", "0"))
         step_count = int(os.environ.get("SGLANG_AMD_FLASH_STAGE_TIMING_STEPS", "1"))
         last_step = first_step + step_count - 1
         if first_step > 0 and step_count > 0 and self.completed_decode_steps == last_step:
             torch.cuda.synchronize(self.device)
-            logger.info("AMD_FLASH_STAGE_TIMING exported rank %s %s", self.rank, self.export_stage_timing())
+            base = None
+            if self.stage_timing is not None:
+                result = self.export_stage_timing()
+                base = result.get("base_ticks")
+                logger.info("AMD_FLASH_STAGE_TIMING exported rank %s %s", self.rank, result)
+            if self.cu_timing is not None:
+                result = self.export_cu_timing(base=base)
+                logger.info("AMD_FLASH_CU_TIMING exported rank %s trace=%s compute_units=%s dropped=%s shared=%s migrated=%s",
+                            self.rank, result["trace"], result["compute_units"], result["dropped"],
+                            result["shared_units"], result["migrated_launch_count"])
 
     @staticmethod
     def native_post(layer, attention, residuals, batch=None):

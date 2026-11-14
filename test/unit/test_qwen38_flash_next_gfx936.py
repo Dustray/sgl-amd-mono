@@ -207,6 +207,8 @@ def test_prefill_rearms_shadow_checks_without_losing_validated_batch_sizes(monke
     runtime.forward_keys = set()
     runtime.completed_decode_steps = 0
     runtime.full_model_shadow_checks = []
+    runtime.stage_timing = None
+    runtime.cu_timing = None
     runtime.peers = SimpleNamespace(check=lambda: None)
     runtime.save = lambda: None
     runtime._decode_states = lambda: []

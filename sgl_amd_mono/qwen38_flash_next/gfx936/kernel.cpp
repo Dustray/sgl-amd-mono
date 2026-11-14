@@ -100,7 +100,42 @@ __device__ __forceinline__ float wave_sum(float value) {
 __device__ int64_t* stage_buffer = nullptr;
 __device__ int64_t stage_capacity = 0;
 
+// Per-CU timing. Same stage numbers, but *every* block records, so a trace can show what each
+// compute unit was doing at any instant. Each block owns a region (no atomics, one writer):
+// header [0] records-per-block, [1] dropped flag, then per block [cursor, (stage, ticks, hw_id)...].
+// hw_id is SE/SH/CU of the wave that wrote the record, read from the HW_ID hardware register.
+__device__ int64_t* cu_buffer = nullptr;
+__device__ int64_t cu_records = 0;
+
+// hwreg(HW_REG_HW_ID, offset 0, size 32): id | (offset << 6) | ((size - 1) << 11).
+#define FLASH_HW_ID_REG 63492
+
+__device__ __forceinline__ unsigned int hardware_id() {
+#ifdef __HIP_DEVICE_COMPILE__
+    return __builtin_amdgcn_s_getreg(FLASH_HW_ID_REG);
+#else
+    return 0u;
+#endif
+}
+
+__device__ __forceinline__ void cu_mark(unsigned int stage) {
+    int64_t records = cu_records;
+    if (cu_buffer == nullptr || records < 1 || threadIdx.x != 0) return;
+    int64_t* region = cu_buffer + 2 + static_cast<int64_t>(blockIdx.x) * (1 + 3 * records);
+    int64_t cursor = region[0];
+    if (cursor >= records) {
+        cu_buffer[1] = 1;
+        return;
+    }
+    volatile int64_t* record = region + 1 + cursor * 3;
+    record[0] = static_cast<int64_t>(stage);
+    record[2] = static_cast<int64_t>(hardware_id());
+    record[1] = static_cast<int64_t>(wall_clock64());
+    region[0] = cursor + 1;
+}
+
 __device__ __forceinline__ void stage_mark(unsigned int stage) {
+    cu_mark(stage);
     int64_t capacity = stage_capacity;
     if (stage_buffer == nullptr || capacity < 4 || blockIdx.x != 0 || threadIdx.x != 0) return;
     unsigned long long index = atomicAdd(reinterpret_cast<unsigned long long*>(stage_buffer), 1ull);
@@ -477,6 +512,14 @@ extern "C" int flash_stage_attach(void* buffer, int64_t capacity) {
     hipError_t status = hipMemcpyToSymbol(HIP_SYMBOL(stage_buffer), &buffer, sizeof(void*));
     if (status != hipSuccess) return status;
     return hipMemcpyToSymbol(HIP_SYMBOL(stage_capacity), &ticks, sizeof(ticks));
+}
+
+// records is the per-block record capacity; the host buffer must hold 2 + Blocks * (1 + 3 * records) int64.
+extern "C" int flash_cu_attach(void* buffer, int64_t records) {
+    int64_t value = records;
+    hipError_t status = hipMemcpyToSymbol(HIP_SYMBOL(cu_buffer), &buffer, sizeof(void*));
+    if (status != hipSuccess) return status;
+    return hipMemcpyToSymbol(HIP_SYMBOL(cu_records), &value, sizeof(value));
 }
 
 extern "C" int flash_allocate(void** pointer, void* handle) {

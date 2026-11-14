@@ -8,7 +8,11 @@ export SGLANG_USE_AITER_LINEAR_ATTN=1
 export SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
-exec python3 -u -m sglang.launch_server \
+# The PATH's python3 may point at a venv without sglang; pin the interpreter that has the
+# server stack installed (override with QWEN_FLASH_PYTHON when needed).
+QWEN_FLASH_PYTHON="${QWEN_FLASH_PYTHON:-/usr/bin/python3}"
+
+exec "$QWEN_FLASH_PYTHON" -u -m sglang.launch_server \
   --model-path "${QWEN_FLASH_NEXT_MODEL_PATH:-/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-Flash-Next/snapshots/master}" \
   --served-model-name Qwen3.8-Flash-Next \
   --host 127.0.0.1 \

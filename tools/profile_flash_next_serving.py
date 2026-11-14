@@ -90,6 +90,28 @@ def shadow_state(info):
     return [{"rank": state["tp_rank"], "acceptance_status": state["acceptance_status"], "whole_decoder_monokernel": state["whole_decoder_monokernel"], "completed_decode_steps": state["completed_decode_steps"], "shadow_checks": len(state["shadow_checks"]), "full_model_shadow_checks": len(state["full_model_shadow_checks"]), "executions": state["executions"]} for state in states]
 
 
+def merge_cu_timing(arguments, mode, directory):
+    """Fold the per-rank per-CU captures (runtime/cu-timing-decode-rank-*.json) into one
+    gzip Perfetto file next to the main trace, so --cu-stages needs no manual merge step."""
+    from tools.merge_flash_next_stage_timing import load, load_cu, merge, summarize, summarize_cu
+
+    runtime = directory / "runtime"
+    traces = load(runtime)
+    cu_traces = load_cu(runtime)
+    if not cu_traces:
+        raise FileNotFoundError(f"No cu-timing-*-rank-*.json in {runtime}; the server may not have reached decode step {arguments.warmup * 3 + 1}")
+    output = directory / ("inference.mono_only.cu_stages.json.gz" if arguments.mono_only else "inference.perfetto.cu_stages.json.gz")
+    merge(traces, output, cu_traces)
+    summary_path = directory / "cu_stages-summary.json"
+    summary_path.write_text(json.dumps({"ranks": [rank for rank, _, _ in traces], "segments": summarize(traces),
+                                        "compute_units": summarize_cu(cu_traces)}, indent=2) + "\n")
+    rows = summarize_cu(cu_traces)
+    fractions = sorted({row["compute_fraction"] for row in rows})
+    print(f"{mode}: per-CU trace exported: {output} ({len(rows)} rank/CU rows, "
+          f"compute fraction {fractions[0] * 100:.1f}%-{fractions[-1] * 100:.1f}%)", flush=True)
+    return output
+
+
 def capture(arguments, mode, directory, url, inputs):
     raw_directory = directory / "ranks"
     raw_directory.mkdir()
@@ -148,6 +170,9 @@ def capture(arguments, mode, directory, url, inputs):
     stage_directory = directory / "runtime" if arguments.kernel_stages and mode == "monokernel" else None
     trace_name = "inference.mono_only.json.gz" if arguments.mono_only else "inference.perfetto.json.gz"
     summary = merge_profiles(trace_paths, directory / trace_name, host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1), device_stage_directory=stage_directory, mono_only=arguments.mono_only)
+    cu_trace = merge_cu_timing(arguments, mode, directory) if arguments.cu_stages and mode == "monokernel" else None
+    if cu_trace:
+        summary["cu_stage_trace"] = str(cu_trace)
     for before_state, after_state in zip(before_shadow, after_shadow):
         expected = next(state["phases"]["DECODE"]["forwards"] for state in summary["ranks"] if state["rank"] == after_state["rank"])
         if after_state["completed_decode_steps"] - before_state["completed_decode_steps"] != expected:
@@ -245,6 +270,12 @@ def run_service(arguments, mode, directory, inputs):
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING"] = "1"
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEP"] = str(arguments.warmup * 3 + 1)
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEPS"] = str(arguments.output_tokens - 1)
+    if arguments.cu_stages and mode == "monokernel":
+        # Every block records, so one step fills ~3.2k of the 8k per-block slots: capture one step.
+        overrides["SGLANG_AMD_FLASH_STAGE_TIMING"] = "1"
+        overrides["SGLANG_AMD_FLASH_CU_TIMING"] = "1"
+        overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEP"] = str(arguments.warmup * 3 + 1)
+        overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEPS"] = str(arguments.cu_steps)
     if arguments.decode_graph:
         overrides["HIP_GRAPH_ACCUMULATE_DISPATCH"] = "0"
     environment.update(overrides)
@@ -333,16 +364,22 @@ def main():
     parser.add_argument("--keep-python-functions", action="store_true")
     parser.add_argument("--mono-only", action="store_true", help="export only Monokernel-related events (fused kernels, device stages, inference/ step markers) to a much smaller merged trace; validation still uses the full per-rank traces")
     parser.add_argument("--kernel-stages", action="store_true", help="embed every measured Monokernel decode step's device-stage spans in the torch-profiler Perfetto trace")
+    parser.add_argument("--cu-stages", action="store_true", help="also record what every compute unit ran (one Perfetto row per CU) into <dir>/runtime/cu-timing-decode-rank-*.json; merge with tools/merge_flash_next_stage_timing.py")
+    parser.add_argument("--cu-steps", type=int, default=1, help="decode steps to record with --cu-stages (per-block buffers hold about two steps)")
     parser.add_argument("--port", type=int, default=30160)
     parser.add_argument("--url", help="Attach to an existing server with profiling ranges already enabled")
     parser.add_argument("--host-event-dir", help="Frontend event directory configured on an attached server")
     parser.add_argument("--allow-busy-gpus", action="store_true", help="only warn, instead of refusing to start, when another job is using the GPUs")
     parser.add_argument("--startup-timeout", type=int, default=1200)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, help="default: profiles/<stamp>_<mode>_<flags>, stamp = %%Y%%m%%d_%%H%%M%%S, flags encode graph/hipprof/mono-only/kernel-stages/cu-stages/in-out/batch")
     parser.add_argument("--resume", action="store_true", help="Append missing modes to an existing run directory without replacing captures")
     arguments = parser.parse_args()
     if arguments.kernel_stages and (arguments.mode != "monokernel" or arguments.hipprof or arguments.url):
         parser.error("--kernel-stages requires a launched --mode monokernel torch-profiler capture")
+    if arguments.cu_stages and (arguments.mode != "monokernel" or arguments.url):
+        parser.error("--cu-stages requires a launched --mode monokernel capture")
+    if arguments.cu_stages and arguments.kernel_stages:
+        parser.error("--cu-stages and --kernel-stages record different step counts; run them separately")
     if arguments.mono_only and (arguments.hipprof or arguments.mode == "native"):
         parser.error("--mono-only requires a torch-profiler capture (not --hipprof) and --mode monokernel")
     if arguments.url and (arguments.mode == "both" or not arguments.host_event_dir):
@@ -351,6 +388,28 @@ def main():
         parser.error("--host-event-dir is only used with --url")
     if arguments.input_tokens < 1 or arguments.output_tokens < 2 or arguments.warmup < 1 or arguments.input_tokens + arguments.output_tokens > 4096:
         parser.error("Require input>=1, output>=2, warmup>=1, input+output<=4096")
+    if arguments.output_dir is None:
+        # Auto-name the run directory: stamp + mode + every flag that changes what is captured,
+        # so re-running with different arguments never collides with an older directory.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        flags = [arguments.mode]
+        if arguments.decode_graph:
+            flags.append("graph")
+        if arguments.hipprof:
+            flags.append("hipprof")
+        if arguments.mono_only:
+            flags.append("monoonly")
+        if arguments.kernel_stages:
+            flags.append("kstages")
+        if arguments.cu_stages:
+            flags.append("cu")
+        flags.append(f"{arguments.input_tokens}-{arguments.output_tokens}")
+        flags.append(f"b{arguments.batch_size}")
+        if arguments.warmup != 2:
+            flags.append(f"w{arguments.warmup}")
+        if arguments.cu_stages and arguments.cu_steps != 1:
+            flags.append(f"csteps{arguments.cu_steps}")
+        arguments.output_dir = ROOT / "profiles" / f"{stamp}_{'_'.join(flags)}"
     directory = arguments.output_dir.resolve()
     directory.mkdir(parents=True, exist_ok=arguments.resume)
     previous_manifest = json.loads((directory / "manifest.json").read_text()) if arguments.resume and (directory / "manifest.json").exists() else None

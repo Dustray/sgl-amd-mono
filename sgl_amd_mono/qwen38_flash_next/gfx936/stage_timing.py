@@ -121,10 +121,10 @@ class StageTiming:
         values = self.buffer[2:2 + 2 * usable].to("cpu", non_blocking=False).view(-1, 2)
         return values, dropped
 
-    def export(self, path, clock_khz, labels=None):
+    def export(self, path, clock_khz, labels=None, base=None):
         records, dropped = self.read()
         clock_khz = clock_khz or int(torch.cuda.get_device_properties(self.device).clock_rate)
-        return export_trace(records, path, clock_khz, self.rank, dropped, labels)
+        return export_trace(records, path, clock_khz, self.rank, dropped, labels, base)
 
 
 def launches(records):
@@ -146,14 +146,39 @@ def launches(records):
         yield current
 
 
-def export_trace(records, path, clock_khz, rank, dropped=False, labels=None):
+def walk(launch):
+    """Yield (phase, name, stage, start_ticks, end_ticks) for one launch's marks.
+
+    The first mark opens the launch and is not a segment of its own. A barrier contributes two
+    spans: the compute that ran before the block arrived, and the block's wait inside the barrier.
+    A mark without its paired release falls back to one `legacy` span.
+    """
+    marks = launch["marks"]
+    previous = marks[0][1] if marks else 0
+    index = 1
+    while index < len(marks):
+        stage, ticks = marks[index]
+        if stage >= SYNC_ARRIVAL_OFFSET and index + 1 < len(marks) and marks[index + 1][0] == stage - SYNC_ARRIVAL_OFFSET:
+            barrier = stage - SYNC_ARRIVAL_OFFSET
+            name = segment_name(launch["kind"], barrier)
+            release = marks[index + 1][1]
+            yield ("compute", name, barrier, previous, ticks)
+            yield ("grid_wait", name, barrier, ticks, release)
+            previous = release
+            index += 2
+            continue
+        yield ("legacy", segment_name(launch["kind"], stage), stage, previous, ticks)
+        previous = ticks
+        index += 1
+
+
+def export_trace(records, path, clock_khz, rank, dropped=False, labels=None, base=None):
     """Write one rank's stages as a Perfetto trace: step -> layer -> kernel -> segment."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     events = [{"ph": "M", "name": "process_name", "pid": rank, "tid": 0, "args": {"name": f"rank {rank} (device stages)"}},
               {"ph": "M", "name": "thread_name", "pid": rank, "tid": 1, "args": {"name": "decode steps"}}]
     ticks_per_us = clock_khz / 1000.0
-    base = None
     step, layer, step_open, layer_open = 0, 0, None, None
     summary = []
     for launch in launches(records):
@@ -178,32 +203,15 @@ def export_trace(records, path, clock_khz, rank, dropped=False, labels=None):
             events.append(_span(rank, 1, f"layer {layer} {layer_open['kind']}",
                                 layer_open["start"], last, base, ticks_per_us))
             layer_open = None
-        previous = first
-        index = 1
-        while index < len(marks):
-            stage, ticks = marks[index]
-            if stage >= SYNC_ARRIVAL_OFFSET and index + 1 < len(marks):
-                barrier_stage = stage - SYNC_ARRIVAL_OFFSET
-                release_stage, release_ticks = marks[index + 1]
-                if release_stage == barrier_stage:
-                    name = segment_name(launch["kind"], barrier_stage)
-                    events.append(_span(rank, 1, name, previous, ticks, base, ticks_per_us, depth_extra=3))
-                    events.append(_span(rank, 1, f"{name} / block 0 grid wait", ticks, release_ticks,
-                                        base, ticks_per_us, depth_extra=4))
-                    summary.extend((
-                        {"kind": launch["kind"], "stage": barrier_stage, "segment": name, "phase": "compute",
-                         "us": (ticks - previous) / ticks_per_us},
-                        {"kind": launch["kind"], "stage": barrier_stage, "segment": name, "phase": "block0_grid_wait",
-                         "us": (release_ticks - ticks) / ticks_per_us},
-                    ))
-                    previous = release_ticks
-                    index += 2
-                    continue
-            events.append(_span(rank, 1, segment_name(launch["kind"], stage), previous, ticks, base, ticks_per_us, depth_extra=3))
-            summary.append({"kind": launch["kind"], "stage": stage, "segment": segment_name(launch["kind"], stage),
-                            "phase": "legacy", "us": (ticks - previous) / ticks_per_us})
-            previous = ticks
-            index += 1
+        for phase, name, stage, start, end in walk(launch):
+            if phase == "grid_wait":
+                events.append(_span(rank, 1, f"{name} / block 0 grid wait", start, end, base, ticks_per_us, depth_extra=4))
+                summary.append({"kind": launch["kind"], "stage": stage, "segment": name,
+                                "phase": "block0_grid_wait", "us": (end - start) / ticks_per_us})
+                continue
+            events.append(_span(rank, 1, name, start, end, base, ticks_per_us, depth_extra=3))
+            summary.append({"kind": launch["kind"], "stage": stage, "segment": name,
+                            "phase": "compute" if phase == "compute" else "legacy", "us": (end - start) / ticks_per_us})
         if launch["kind"] == "tail":
             if step_open is not None:
                 events.append(_span(rank, 1, f"step {step}", step_open["start"], last, base, ticks_per_us))
@@ -211,7 +219,8 @@ def export_trace(records, path, clock_khz, rank, dropped=False, labels=None):
     events = [event for event in events if event is not None]
     text = '{"displayTimeUnit":"ms","traceEvents":[' + ",".join(json.dumps(event, separators=(",", ":")) for event in events) + "]}"
     path.write_text(text)
-    return {"trace": str(path), "rank": rank, "steps": step, "events": len(events), "dropped": dropped, "segments": summary}
+    return {"trace": str(path), "rank": rank, "steps": step, "events": len(events), "dropped": dropped,
+            "base_ticks": base, "segments": summary}
 
 
 def _span(pid, tid, name, start, end, base, ticks_per_us, depth_extra=0):

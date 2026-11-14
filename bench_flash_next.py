@@ -392,7 +392,7 @@ def parse_arguments():
     parser.add_argument("--url", help="attach to a running server instead of launching one (it must match --mode/--graph)")
     parser.add_argument("--port", type=int, default=30160)
     parser.add_argument("--model-path", default=MODEL)
-    parser.add_argument("--output-dir", type=Path, help="default: bench_results/<timestamp>_<mode>_<graph>")
+    parser.add_argument("--output-dir", type=Path, help="default: bench_results/<timestamp>_<mode>_<graph|eager>_<batch>_<in-out>_<repeats>")
     parser.add_argument("--keep-server", action="store_true", help="leave the launched server running at the end")
     parser.add_argument("--numa", choices=("auto", "on", "off"), default="off", help="bind rank i to NUMA node i (on), or only if every node has enough free memory (auto); other jobs on this host fill NUMA 0, so off by default")
     parser.add_argument("--strict-accuracy", action="store_true", help="mono: refuse requests when the shadow accuracy check fails instead of recording it")
@@ -419,7 +419,14 @@ def parse_arguments():
 def main():
     arguments = parse_arguments()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    directory = (arguments.output_dir or ROOT / "bench_results" / f"{stamp}_{arguments.mode}_{'graph' if arguments.graph else 'eager'}").resolve()
+    # Encode every axis that changes the measurement into the default directory name, so
+    # runs with different arguments never collide and no manual renaming is needed.
+    batches = "-".join(str(size) for size in sorted(arguments.batch_size))
+    lengths = "-".join(f"{input_len}-{output_len}" for input_len in arguments.input_len for output_len in arguments.output_len)
+    default_name = f"{stamp}_{arguments.mode}_{'graph' if arguments.graph else 'eager'}_b{batches}_{lengths}_r{arguments.repeats}"
+    if arguments.profile:
+        default_name += "_profile" + ("_monoonly" if arguments.profile_mono_only else "")
+    directory = (arguments.output_dir or ROOT / "bench_results" / default_name).resolve()
     directory.mkdir(parents=True, exist_ok=False)
     cases = [(batch, input_len, output_len) for batch in sorted(arguments.batch_size) for input_len in arguments.input_len for output_len in arguments.output_len]
     report = {"started_at": datetime.now(timezone.utc).isoformat(), "argv": sys.argv, "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(arguments).items()},

@@ -38,10 +38,12 @@ upstream gfx950 models are out of scope unless the user asks.
 | `sgl_amd_mono/qwen38_flash_next/gfx936/` | Mono implementation: HIP C++ kernels (`kernel.cpp`, `gdn.cpp`, `qsa.cpp`, `ple.cpp`, `decode_io.cpp`), `runner.py` (runtime, shadow checks), `graph.py` (decode-graph capture/replay checks), `program.py` (hipcc build, cached by source hash under `$SGLANG_AMD_FLASH_REPORT_DIR/codegen`), `contract.py` (startup config checks), `native_sources.json` (pinned SGLang interface hashes) |
 | `sgl_amd_mono/qwen38_flash_next/gfx936/{reference,accuracy_trace}.py` | Deterministic reference policy (opt-in); per-forward logits capture for native-vs-mono services (`SGLANG_AMD_FLASH_ACCURACY_TRACE_DIR`). `SGLANG_AMD_FLASH_CAPTURE_QSA_STEP` / `_LAYERS` dump QSA state on rank 2 for diagnosis |
 | `compat/sglang0518/src/sgl_amd_mono_0518/flash_next.py` | SGLang 0.5.18 HookRegistry plugin: installs the runtime after `ModelRunner.initialize`, wraps decode-graph capture/execute, exposes state in `/server_info` |
+| `sgl_amd_mono/qwen38_flash_next/gfx936/{stage_timing,cu_timing}.py` | Device-side timing exporters: per-barrier stages (block 0) and per-compute-unit occupancy (every block, one Perfetto row per CU) |
 | `sgl_amd_mono/common/profiling.py`, `profile_trace.py` | Profile range markers (`SGLANG_AMD_PROFILE_RANGES=1`) and the 8-rank Perfetto merge. `merge_profiles(..., mono_only=True)` (CLI: `--mono-only` / `--profile-mono-only`) validates on the full traces but exports only fused kernels, device stages, `inference/` step markers and `mono/` ranges → `inference.mono_only.json.gz`, ~1% of the events (b1 512→64: 313 MB → 2.3 MB); host/frontend/client events dropped |
 | `tools/profile_flash_next_serving.py` | Standalone profile capture (`--mode native|monokernel`, `--decode-graph`): torch profiler → merged Perfetto, or `--hipprof` for a HIP-level `.pftrace` |
 | `tools/summarize_serving_profile.py`, `tools/validate_serving_profile.py`, `tools/profile_queries.sql` | Re-merge raw rank traces; validate a merged trace with Perfetto trace processor (`/tmp/monokernel-perfetto/linux-amd64/trace_processor_shell`, may need re-download) |
 | `tools/verify_flash_next_{gdn,qsa,ple,io,hc,moe,tp8}.py` | Per-module real-weight checks |
+| `tools/verify_flash_next_cu_timing.py` | Device check for the per-CU marks: runs `hc_mix` on one GPU (no model) and verifies CU placement, mark order and drops |
 | `tools/verify_flash_next_{serving,correctness,batch_accuracy,default_accuracy}.py`, `run_flash_next_accuracy_matrix.py`, `diagnose_flash_next_*` | Accuracy acceptance and diagnosis (still failing, see below) |
 | `tools/source_status.py --verify` | Checks pinned SGLang interface files |
 | `profiles/` | Curated Perfetto traces (git-ignored), b1 512→64: native eager, native decode-graph, mono eager |
@@ -90,6 +92,8 @@ Important environment variables:
 |---|---|
 | `SGLANG_AMD_FLASH_NEXT_0518=1` | Attach the mono runtime (0 = native) |
 | `SGLANG_AMD_FLASH_REPORT_DIR` | Per-run dir for `rank-*.json` and the kernel codegen cache |
+| `SGLANG_AMD_FLASH_STAGE_TIMING=1`, `_STEP`, `_STEPS`, `_RECORDS` | Block-0 device stage timing: enable, first decode step to export, step count, buffer records |
+| `SGLANG_AMD_FLASH_CU_TIMING=1`, `_RECORDS` | Per-CU device timing (one row per compute unit); uses the same `_STEP`/`_STEPS` |
 | `SGLANG_AMD_FLASH_SHADOW_STEPS` / `_REARM_ON_PREFILL=0` | Shadow (native reference) checks per batch size; `REARM=0` keeps them out of timed requests |
 | `SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES=1` | Record shadow accuracy failures and keep serving (needed for any perf run today) |
 | `SGLANG_AMD_FLASH_ACCURACY_REFERENCE=1` | Deterministic reference policy for accuracy work only; never for perf |
@@ -146,6 +150,47 @@ python3 tools/merge_flash_next_stage_timing.py --run-dir <run>/runtime   # 8 ran
 - Previous device validation (2026-11-10, before kernel-entry markers): 4 records per `hc_mix` launch,
   monotonic ticks; `hc_mix` 342 us, `mix.down` 316 us for one decode row. Unit tests:
   `test/unit/test_flash_next_stage_timing.py`.
+
+## Per-CU timing (one Perfetto row per compute unit)
+
+Stage timing is block 0 only. With `SGLANG_AMD_FLASH_CU_TIMING=1` **every** block marks the same
+stages and each record carries its wave's `HW_ID`, so the trace gets one row per compute unit and
+shows which operator a given CU was running at an instant, and whether it was computing or parked
+in a grid barrier (`sgl_amd_mono/qwen38_flash_next/gfx936/cu_timing.py`).
+
+```bash
+SGLANG_AMD_FLASH_STAGE_TIMING=1 SGLANG_AMD_FLASH_CU_TIMING=1 SGLANG_AMD_FLASH_STAGE_TIMING_STEP=5 \
+  SGLANG_AMD_FLASH_REPORT_DIR=<run>/runtime python3 bench_flash_next.py --mode mono --graph --input-len 512 --output-len 64
+python3 tools/merge_flash_next_stage_timing.py --run-dir <run>/runtime   # stage rows + per-CU rows, one file
+python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --output-dir <dir>   # inside a profile run
+```
+
+- Rows are named `SE<se>.SH<sh>.CU<cu> (block <b>)`; spans are `layer 12 gdn: conv state` (cat
+  `cu_compute`) and `wait conv state` (cat `cu_wait`), with `args` carrying block, step, layer,
+  kernel, stage and CU. The merged file keeps per-CU processes at pid `100 + rank`, clear of the
+  stage-timing pids, and the summary JSON gains a `compute_units` section (per-CU compute vs. wait
+  totals and compute fraction, printed as the most barrier-bound / most compute-bound CUs).
+- `cu_mark()` sits inside `stage_mark()` in `kernel.cpp`, so the per-CU and block-0 streams always
+  agree and no kernel needs its own instrumentation. Only thread 0 of each block writes, into that
+  block's own region, so there are no atomics and marks stay in program order.
+- Buffer: `[0]` records per block, `[1]` dropped flag, then per block `[cursor, (stage, ticks, hw_id)...]`.
+  `SGLANG_AMD_FLASH_CU_TIMING_RECORDS` (default 8192, ~15.7 MiB per rank) holds about two decode
+  steps — one step is ~3150 marks per block — so capture one step at a time and check `dropped`.
+- The CU trace reuses the stage trace's tick base when both are on, so the two sets of rows line up
+  in one timeline. Across ranks compare durations only, never absolute timestamps.
+- `HW_ID` decoding is gfx9 (`cu` bits 8-11, `sh` bit 12, `se` bits 13-15); wave/SIMD/pipe are
+  recorded but deliberately not part of a row's identity.
+- **A block keeps its CU within one launch but is placed elsewhere on the next launch**, so spans
+  are attributed per launch and one CU row legitimately hosts several blocks over a trace
+  (`shared_units` reports that; it is not an error). A block that changed CU *inside* a launch
+  would break attribution and is counted in `migrated_launch_count` — measured 0 so far.
+- Device check (no model, one GPU, ~1 s): `python3 tools/verify_flash_next_cu_timing.py --device 0
+  --launches 4`. Run it after touching `kernel.cpp`. 2026-11-13 on gfx936 card 0: 80 blocks land on
+  80 distinct CUs on every launch (1 block per CU, 0 idle CUs, 36 marks per block, no drops), SE
+  0-7 × CU ids 0-10. Same run: `hc_mix` for one decode row spends ~23 us computing and ~361 us in
+  grid barriers per launch per CU — consistent with the 342 us `hc_mix` from the stage timing.
+- Not embedded in the torch-profiler merged trace (`inference.perfetto.json.gz`) — the per-CU rows
+  are a separate Perfetto file. Unit tests: `test/unit/test_flash_next_cu_timing.py`.
 
 ## Status (2026-11-10)
 
