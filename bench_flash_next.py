@@ -250,6 +250,9 @@ async def generate(session, url, token_ids, output_len):
             now = time.perf_counter() - started
             arrivals.extend([now] * (count - len(arrivals)))
             final = event
+    #         if "text" in event:
+    #             print(event["text"], end="", flush=True)
+    # print(flush=True)
     e2e = time.perf_counter() - started
     metadata = final["meta_info"]
     if metadata["completion_tokens"] != output_len or len(arrivals) != output_len:

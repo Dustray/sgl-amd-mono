@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next BF16：原生 vs Monokernel 性能
 
-更新：2026-11-15（性能数据为 11-10）。
+更新：2026-11-16（主表性能数据为 11-10，算子修改记录见文末）。
 
 ## 环境基本信息
 
@@ -353,3 +353,74 @@ python3 tools/verify_flash_next_cu_timing.py --device 0 --launches 4
 | `--output-dir` | — | 写出 Perfetto trace 和报告 |
 
 11-13 在 card 0 上：80 个 block 落在 80 个不同的 CU 上，每 block 36 个打点，没有丢失；`hc_mix` 每次 launch 每个 CU 约 23 us 在算、约 361 us 在 grid barrier 里等。
+
+
+## Mono 算子修改记录（11-16）
+
+下面几处改动都是同一类问题：某个阶段的任务数太少，只有少数几个 block 在算，其余 block 停在 grid barrier 里等。per-CU trace 里看到的“某几个 CU 特别长”就是这几个 block 所在的 CU（block 每次 launch 落在不同 CU 上，所以每层长的 CU 不一样）。
+
+trace 里的阶段名按“结束于哪个 barrier”命名，和实际内容有出入：post kernel 的 `router.top10`（stage 40）实际是 **router gemv**，`shared gate`（stage 41）实际是 **top-10 选择 + shared gate gemv**。
+
+| # | 算子 | 改前 | 改动 | 精度 | 状态 |
+|---|---|---|---|---|---|
+| 1 | HC `mix.down`（10240→320，`run_mix`，hc_mix / post / gdn / qsa / tail 共用） | 普通 gemv，20 个 tile，只有 block 0–4 在算，每个 wave 走完 640 步 K；layer 8 gdn 约 276 us | `mix_down_partials`：拆成 tile × 256 列的 split-K 任务（b1 共 800 个，所有 wave 都有活），FP32 部分和写到 `partials [2, 40, 320]`；barrier 后每个 block 按 chunk 顺序把 40 个部分和加进 LDS（`mix_down_reduce`），直接给 mix.up 用 | 求和顺序与 `matvec16(split_k=256)` 相同，**逐位一致**（72/72 个张量：输出、lowrank、gates，4 层，b1/b2） | 已验证：单独测 `hc_mix` b1 从 340–360 us 降到 91 us，b2 111 us；`verify_flash_next_{hc,gdn,qsa,io,moe}` 通过 |
+| 2 | MoE top-10 选择（post kernel，stage 41） | block 0 一个线程串行：10 轮 × 512 个专家，每轮从显存重读 logits，还要和已选专家逐个比较；rank 0 上 block 0 中位数约 **493 us/层**，48 层约 24 ms/token | `router_topk`：每行用一个 wave（block 1+row 的 wave 0，和 block 0 上的 shared gate gemv 并行）。每个 lane 在寄存器里放 8 个 logits，最大值和每轮 argmax 都用 wave 内 butterfly 归约，已选专家用位掩码标记 | 选择规则不变（严格 `>`、相同值取最小 id、-inf/NaN 不会选中）；概率按选择顺序串行求和再相除，按设计应逐位一致 | 已改代码，逐位一致**尚未验证** |
+| 3 | router gemv（2560→512，post kernel，stage 40） | 512/16 = 32 个 tile，只有 block 0–7 在算；`matvec16` 每 16 列发一次 load 就等它返回，一个 tile 要等 160 次；约 **64 us/层** | `router_gemv`：每个 wave 一次预取 128 列，算当前块的同时加载下一块（双缓冲），等待次数降到约 20 次 | 一个累加器串过整个 K，MMAC 顺序与 `matvec16(split_k=0)` 相同，按设计应逐位一致 | 已改代码，逐位一致**尚未验证**。改完后仍只有 32 个 wave 在算，所以这几个 CU 仍会比其余的长 |
+| 4 | GDN `qkvz+ba gemv`（2560→2048 + 2560→12，gdn kernel，stage 310） | 两次普通 gemv：qkvz 128 个 tile（b1）用 wave 0–127，ba 1 个 tile 又从 wave 0 开始，所以 wave 0 串行做两个 tile；每个 tile 同样是 160 次串行 load | 双缓冲 gemv 抽成公共的 `matvec16_pipelined`（router gemv 也改用它）；qkvz 和 ba 放进同一个任务空间，ba 排在 qkvz 之后（b1 在 wave 128，b2 在 wave 256/257），不再和 qkvz tile 0 挤在 wave 0 | 与 #3 相同，按设计应逐位一致 | 已编译运行，stage 310 降到改前的约 30%；TPOT 43.09 → 40.37 ms。逐位一致**尚未验证**。b1 仍只有 129/320 个 wave 有活，见下文“待做” |
+
+关于第 3 项：要让 80 个 block 都参与 router gemv，只能做跨 wave 的 split-K，但这会改变 router logits 的舍入。路由边界（第 10/11 个专家）打平本来就是已知的精度问题，所以这次没有做 split-K。
+
+改前的数据来自 `profiles/20261116_150357_monokernel_monoonly_cu_512-64_b1_csteps2`（rank 0，2 个 decode step × 48 层，per-CU 计时）。第 2、3 项待做的验证：
+
+```bash
+python3 tools/verify_flash_next_moe.py            # router logits / top_ids / top_weights 与改前逐位一致
+python3 tools/verify_flash_next_cu_timing.py --device 0 --launches 4
+python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --cu-stages --cu-steps 2 --mono-only \
+  --input-tokens 512 --output-tokens 64 --output-dir <目录>   # 看 stage 40/41 是否变短
+```
+
+### 改动后的端到端性能（11-16，batch 1，512→64，Mono 不开 Graph）
+
+| 版本 | TTFT ms | TPOT ms | E2E s | decode tok/s |
+|---|---:|---:|---:|---:|
+| 改前 Mono（11-10，主表） | 633 | 94.7 | 6.60 | 10.56 |
+| 11-16 前一次测量（#1、#2） | 604 | 45.03 | 3.44 | 22.21 |
+| 11-16（#1、#2、#3） | 587 | 43.09 | 3.30 | 23.21 |
+| **11-16 最新（#1–#4）** | **597** | **40.37** | **3.14** | **24.77** |
+| 参照：原生 + Graph（11-10，主表） | 660 | 45.5 | 3.53 | 21.96 |
+
+3 轮明细：
+
+| 版本 | 轮次 | TTFT ms | TPOT ms | E2E s | decode tok/s |
+|---|---:|---:|---:|---:|---:|
+| #1、#2、#3 | 1 | 579.0 | 42.84 | 3.278 | 23.35 |
+| | 2 | 578.0 | 43.09 | 3.293 | 23.21 |
+| | 3 | 604.5 | 43.33 | 3.334 | 23.08 |
+| #1–#4 | 1 | 596.2 | 40.34 | 3.138 | 24.79 |
+| | 2 | 594.4 | 40.37 | 3.138 | 24.77 |
+| | 3 | 600.1 | 40.39 | 3.145 | 24.76 |
+
+#1、#2、#3：prefill 581.07 ms，output tok/s 19.38，数据在 `bench_results/20261111_monokernel_eager_b1_512-64-1/`。#1–#4：prefill 590.22 ms，output tok/s 20.38。
+
+- Mono 不开 Graph 的 TPOT 从 94.7 ms 降到 40.37 ms（−57%），比原生 + Graph 的 45.5 ms 快约 11%。
+- 精度：#1 已验证逐位一致；#2、#3、#4 的逐位一致还没验证，这些数字只代表性能。
+- #1、#2、#3 之后的 per-CU profile：`profiles/20261116_162253_monokernel_monoonly_cu_512-64_b1_csteps2`。
+
+### 待做：gemv 阶段仍有空闲 CU（未实现）
+
+现象：#4 之后 `qkvz+ba gemv` 仍有约 60% 的 CU 空闲；有负载的 CU 里有一个明显较短。
+
+原因：
+- 一个 tile 是 16 个输出（MMAC 16x16x16 的宽度），每个 tile 由一个 wave 走完整个 K = 2560。b1 时 qkvz 128 个 tile 加 ba 1 个，共 129 个任务，对 320 个 wave。
+- 任务按 `wave = blockIdx.x * 4 + wave_in_block` 分配，先把前面的 block 排满：qkvz 落在 block 0–31（每个 block 4 个 wave），ba 单独落在 **block 32** 的 wave 0（b2 为 block 64）。block 32 那个较短的 CU 应该就是 ba，可以在 Perfetto 里看 `args.block` 确认。
+- ba 每个 wave 的工作量和 qkvz 差不多（12 行对 16 行），却明显更短。这说明现在每个 tile 的耗时主要受同一 CU 上 4 个 wave 抢访存限制，而不是单个 wave 的速度。
+
+可选做法，按建议顺序：
+
+| 做法 | 内容 | 任务 / CU 占用（b1） | 精度 |
+|---|---|---|---|
+| 1. 换映射 | 改成 `wave = wave_in_block * Blocks + blockIdx.x`，先横向铺满 80 个 block。qkvz+ba 和 router gemv 都改 | qkvz+ba：80 个 CU 各 1–2 个 wave；router：32 个 CU 各 1 个 wave（原来 8 个 CU 各 4 个） | 逐位一致，改一行 |
+| 2. 按行拆 tile | 一个 tile 分给两个 wave，各算 8 行，另外 8 行权重读 0（`matvec16_pipelined` 的 `valid` 加指针偏移）。MMAC 第 i 行只依赖权重第 i 行，累加顺序不变 | 257 个任务，约 80% 的 wave | 逐位一致；MMAC 条数翻倍，但这一段受访存限制 |
+| 3. split-K | K 切 2 段写 FP32 部分和，在 conv state 阶段（z 部分在 recurrent 阶段）读取时求和，不用加 barrier | 258 个任务，配合做法 2 为 514 个 | **舍入会变**，不再和现在的 mono 逐位一致。qkvz 是连续值，不像 router 有离散跳变；native 用 hipBLAS，求和顺序本来就不同。要重跑 `verify_flash_next_gdn` 和对 native 的精度矩阵 |
+
+拆成每 wave 4 行（516 个任务，1.6 轮）负载反而不均，不建议。做法 3 之前，先用 stage 310 的时间算一下带宽：qkvz+ba 权重每层每卡约 10.5 MB（2060 × 2560 × 2 B）。如果已经接近 gfx936 实测的 HBM 带宽，铺到更多 CU 也快不了多少。

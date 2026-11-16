@@ -71,8 +71,26 @@ __global__ __launch_bounds__(Threads, 1) void gdn_attention(GDNArguments args) {
     __shared__ float head_output[Head];
     if (!run_mix(args.mix, 300)) return;
     int rows = args.mix.rows;
-    gemv(args.mix.output, args.qkvz_weight, args.projected, nullptr, rows, Hidden, LocalProjection, 0);
-    gemv(args.mix.output, args.ba_weight, args.projected_ba, nullptr, rows, Hidden, LocalHeads * 2, 0);
+    // qkvz (2560 -> 2048, 128 tiles per row) and ba (2560 -> 12, 1 tile per row) share one task
+    // space: the ba tile of row r is task rows * 128 + r, so it gets its own wave instead of running
+    // after qkvz tile 0 on wave 0 (two plain gemv calls both started at wave 0).
+    {
+        constexpr int ProjectionTiles = LocalProjection / 16;
+        int wave = blockIdx.x * 4 + threadIdx.x / 64;
+        int lane = threadIdx.x & 63;
+        for (int task = wave; task < rows * (ProjectionTiles + 1); task += Blocks * 4) {
+            if (task < rows * ProjectionTiles) {
+                int row = task / ProjectionTiles;
+                int base = task % ProjectionTiles * 16;
+                float value = matvec16_pipelined(args.mix.output + row * Hidden, args.qkvz_weight + int64_t(base) * Hidden);
+                if (lane < 16) args.projected[row * LocalProjection + base + lane] = BFloat16(value);
+            } else {
+                int row = task - rows * ProjectionTiles;
+                float value = matvec16_pipelined(args.mix.output + row * Hidden, args.ba_weight, LocalHeads * 2);
+                if (lane < LocalHeads * 2) args.projected_ba[row * LocalHeads * 2 + lane] = BFloat16(value);
+            }
+        }
+    }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 310)) return;
     for (int work = blockIdx.x * Threads + threadIdx.x; work < rows * LocalConv; work += Blocks * Threads) {
         int row = work / LocalConv;
