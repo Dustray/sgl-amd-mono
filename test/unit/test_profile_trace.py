@@ -195,8 +195,15 @@ def test_merge_embeds_device_stages_on_named_tracks(tmp_path):
             json.dump({"traceEvents": stage_spans + second_step}, output)
         paths.append(path)
 
+    compute_only = merge_profiles(paths, tmp_path / "compute.json.gz", expected_ranks=2, expected_decode_steps=1,
+                                  device_stage_directory=tmp_path)
+    compute_events = read_trace(tmp_path / "compute.json.gz")["traceEvents"]
+    assert not any(event.get("name", "").endswith("block 0 grid wait") for event in compute_events)
+    assert not any("block 0 grid waits" in event.get("args", {}).get("name", "") for event in compute_events
+                   if event.get("ph") == "M")
+    assert compute_only["device_kernel_stages"]["launches"] == 16
     summary = merge_profiles(paths, tmp_path / "merged.json.gz", expected_ranks=2, expected_decode_steps=1,
-                             device_stage_directory=tmp_path)
+                             device_stage_directory=tmp_path, keep_device_waits=True)
     events = read_trace(tmp_path / "merged.json.gz")["traceEvents"]
     entry_kernel = next(event for event in events if event.get("cat") == "kernel" and event.get("name", "").startswith("decode_entry("))
     entry_span = next(event for event in events if event.get("cat") == "mono_kernel" and event.get("name") == "entry")

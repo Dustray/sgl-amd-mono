@@ -141,8 +141,15 @@ python3 tools/merge_flash_next_stage_timing.py --run-dir <run>/runtime   # 8 ran
   Names live in `stage_timing.py:SEGMENTS`; add a name there when you add a barrier.
 - Buffer layout: `[0]` cursor, `[1]` dropped flag, then `(stage, ticks)` pairs. Attach happens per
   compiled library — each `.so` includes `kernel.cpp` and has its own copy of the device symbol.
-- Only block 0 / thread 0 marks, so the timestamp is "block 0 reached this barrier"; a segment is the
-  delta between consecutive marks. Ticks convert with `clock_khz` from `flash_info`.
+- Only block 0 / thread 0 marks: each barrier gives block 0's arrival (`stage + 1000`) and the release. Since
+  2026-11-16 a stage span runs **previous release → this release**, i.e. until the slowest block arrived, so it is
+  the whole grid's time for that stage; block 0's own share is in `args.block0_compute_us` / `block0_wait_us`.
+  Before that the span ended at block 0's arrival and read like an all-CU time while understating it (layer 8 gdn
+  `mix.down`: block 0 235 us vs. 276 us release to release; only 20 tiles = blocks 0-4 work in that gemv, and block 0
+  is not the slowest). Old `stage-timing-*.json` files are widened on read (`profile_trace.widen_segments`), so
+  re-merging old runs gives the new spans. Ticks convert with `clock_khz` from `flash_info`.
+- Per-CU rows are named by hardware CU, **not** by block: block 0 lands on a different CU every launch (one 2-step
+  capture: 198 launches over all 80 CUs), so the block-0 stage row matches whichever CU row has `args.block == 0`.
 - Ranks do not share a clock in the raw `stage-timing-*` / `cu-timing-*` files. `tools/merge_flash_next_stage_timing.py`
   aligns them (default `--align fit`): it matches the releases of the cross-rank `peer wait` barriers (stages 14, 54,
   514, 614, 634; ~99 per decode step) and fits `t_rank0 = a·t_rank + b` per rank, applied to stage and per-CU rows
@@ -210,6 +217,14 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --outp
   80 distinct CUs on every launch (1 block per CU, 0 idle CUs, 36 marks per block, no drops), SE
   0-7 × CU ids 0-10. Same run: `hc_mix` for one decode row spends ~23 us computing and ~361 us in
   grid barriers per launch per CU — consistent with the 342 us `hc_mix` from the stage timing.
+- Merged Perfetto files leave out idle spans (2026-11-15): `cu_wait`, `cu_gap` and `/ block 0 grid wait`
+  spans are left out (the block-0 wait is still inside the release-to-release stage span) of `merge_flash_next_stage_timing.py` output and of the stages `merge_profiles` embeds, so an empty
+  stretch on a row means wait or idle. Alignment, `cu_check` and the summary wait/gap totals still come from the raw
+  inputs. Add them back with `--keep-idle` / `merge(..., keep_idle=True)` / `merge_profiles(..., keep_device_waits=True)`.
+- When per-CU traces are merged, `grid (all CUs)` spans cover each `(step, layer, kernel, stage)` from the earliest
+  block compute start to the latest block barrier arrival; this is distinct from the block-0 stage row and excludes
+  post-arrival barrier release time. `--no-grid` disables these spans. `stage_mark` reads `wall_clock64()` once and
+  shares that tick between stage and per-CU records.
 - Not embedded in the torch-profiler merged trace (`inference.perfetto.json.gz`) — the per-CU rows
   are a separate Perfetto file. Unit tests: `test/unit/test_flash_next_cu_timing.py`.
 

@@ -90,10 +90,34 @@ def is_mono_event(event):
     return False
 
 
+STAGE_WAIT_SUFFIX = " / block 0 grid wait"
+
+
+def widen_segments(spans):
+    """Upgrade stage spans exported before 2026-11-16 in place: those ended a segment at block 0's
+    barrier arrival. Each segment directly followed by its block-0 grid wait is extended to the
+    wait's end (the barrier release, i.e. the slowest block) and gets the block-0 split in args.
+    Spans already in the release-to-release form are left alone. Returns `spans`."""
+    previous = None
+    for event in spans:
+        if event.get("ph") != "X":
+            continue
+        name = event.get("name", "")
+        if (name.endswith(STAGE_WAIT_SUFFIX) and previous is not None and previous["name"] == name[:-len(STAGE_WAIT_SUFFIX)]
+                and "block0_compute_us" not in previous.get("args", {})
+                and abs(previous["ts"] + previous["dur"] - event["ts"]) < 1e-3):
+            args = previous.setdefault("args", {})
+            args.update({"span": "barrier release to release (all blocks)",
+                         "block0_compute_us": previous["dur"], "block0_wait_us": event["dur"]})
+            previous["dur"] = event["ts"] + event["dur"] - previous["ts"]
+        previous = event if event.get("args", {}).get("depth") == 3 else None
+    return spans
+
+
 def _embed_device_stage_events(events, stage_trace, rank):
     """Align one device-stage decode step with its GPU kernels and return Perfetto spans."""
-    stage_spans = [event for event in stage_trace.get("traceEvents", [])
-                   if event.get("ph") == "X" and event.get("cat") == "stage"]
+    stage_spans = widen_segments([event for event in stage_trace.get("traceEvents", [])
+                                  if event.get("ph") == "X" and event.get("cat") == "stage"])
     launch_spans = sorted(
         (event for event in stage_spans if event.get("args", {}).get("depth") == 2),
         key=lambda event: event["ts"],
@@ -193,7 +217,7 @@ def _embed_device_stage_events(events, stage_trace, rank):
                       "max_launch_start_error_us": max_launch_start_error}
 
 
-def merge_profiles(trace_paths, output, host_directory=None, client_events=(), expected_ranks=8, expected_decode_steps=None, include_python_functions=False, expected_decode_token_rows=None, device_stage_directory=None, mono_only=False, progress=None):
+def merge_profiles(trace_paths, output, host_directory=None, client_events=(), expected_ranks=8, expected_decode_steps=None, include_python_functions=False, expected_decode_token_rows=None, device_stage_directory=None, mono_only=False, progress=None, keep_device_waits=False):
     """Merge per-rank torch-profiler traces into one Perfetto-compatible trace.
 
     ``progress`` (optional) is called with a short human-readable message at every long stage
@@ -321,10 +345,13 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
                 stage_pid = identity("pid", rank, stage_summary["pid"])
                 stage_tid = identity("tid", rank, (stage_summary["pid"], "monokernel-device-stages"))
                 emit({"ph": "M", "name": "thread_name", "pid": stage_pid, "tid": stage_tid,
-                      "args": {"name": f"Monokernel internal stages / compute / TP{rank} / device clock"}})
+                      "args": {"name": f"Monokernel internal stages / all blocks, release to release / TP{rank} / device clock"}})
                 wait_tid = identity("tid", rank, (stage_summary["pid"], "monokernel-grid-waits"))
-                emit({"ph": "M", "name": "thread_name", "pid": stage_pid, "tid": wait_tid,
-                      "args": {"name": f"Monokernel block 0 grid waits / TP{rank} / device clock"}})
+                if keep_device_waits:
+                    emit({"ph": "M", "name": "thread_name", "pid": stage_pid, "tid": wait_tid,
+                          "args": {"name": f"Monokernel block 0 grid waits / TP{rank} / device clock"}})
+                else:  # block-0 grid waits (depth 4) are left out of the exported trace
+                    embedded = [event for event in embedded if event.get("args", {}).get("depth") != 4]
                 for event in embedded:
                     process = event["pid"]
                     event["pid"] = identity("pid", rank, process)

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next BF16：原生 vs Monokernel 性能
 
-更新：2026-11-10。
+更新：2026-11-15（性能数据为 11-10）。
 
 ## 环境基本信息
 
@@ -109,12 +109,32 @@ python3 bench_flash_next.py --mode mono --graph --batch-size 1 2 --input-len 64 
 python3 bench_flash_next.py --mode mono --graph --profile --input-len 512 --output-len 64
 ```
 
-主要参数：
-- 测试开始前会检查 8 张卡是否空闲，有别人的任务在跑就直接报错退出（`--allow-busy-gpus` 可以跳过检查）。这台机器是共用的，**任何一张卡被别人占满，整个服务都会卡住**：每层都要做两次 8 卡通信，一张卡慢，其余 7 张就全在等它，看起来像没有负载地卡死。
-- `--repeats` / `--warmups`：正式测量 / 预热次数。
-- `--url`：连接已经在跑的服务，不另外启动。
-- `--keep-server`：测完不关服务，方便再用 `--url` 接着测别的组合。
-- `--` 之后的内容会原样传给 sglang 作为服务参数。
+测试开始前会检查 8 张卡是否空闲，有别人的任务在跑就直接报错退出（`--allow-busy-gpus` 可以跳过检查）。这台机器是共用的，**任何一张卡被别人占满，整个服务都会卡住**：每层都要做两次 8 卡通信，一张卡慢，其余 7 张就全在等它，看起来像没有负载地卡死。
+
+`bench_flash_next.py` 全部参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--mode native\|mono` | 必填 | decode 走 SGLang 原生还是 Monokernel |
+| `--graph` | 关 | 只为本次用到的 batch 捕获 decode graph（不 padding） |
+| `--batch-size N [N ...]` | 1 | 每轮同时发出的请求数；Mono 只支持 1、2 |
+| `--input-len N [N ...]` | 512 | 每个请求的输入 token 数 |
+| `--output-len N [N ...]` | 64 | 每个请求的输出 token 数（`ignore_eos`） |
+| `--repeats` | 3 | 每组正式测量轮数 |
+| `--warmups` | 1 | 每组正式测量前的预热轮数 |
+| `--seed` | 42 | 随机输入 token 和服务端的种子 |
+| `--profile` | 关 | 正式测量跑完后，每组再采一份 torch-profiler trace（见下面用例 1） |
+| `--profile-mono-only` | 关 | 配合 `--profile`，只导出 Monokernel 相关事件的精简 trace |
+| `--url` | — | 连接已经在跑的服务，不另外启动（服务须与 `--mode` / `--graph` 一致） |
+| `--port` | 30160 | 自己启动服务时用的端口 |
+| `--model-path` | Flash-Next 快照 | 模型路径 |
+| `--output-dir` | `bench_results/<时间>_<模式>_<graph\|eager>_...` | 结果目录 |
+| `--keep-server` | 关 | 测完不关服务，方便再用 `--url` 接着测别的组合 |
+| `--numa auto\|on\|off` | off | rank i 绑 NUMA 节点 i；别人的任务常占满 NUMA 0，绑上会让 rank 0 加载时被 OOM 杀掉，所以默认不绑 |
+| `--strict-accuracy` | 关 | Mono：shadow 精度检查失败时拒绝请求，而不是只记录 |
+| `--allow-busy-gpus` | 关 | 卡被占用时只警告，不退出 |
+| `--startup-timeout` | 1800 | 等服务启动的秒数（加载模型约 4–5 分钟） |
+| `-- <sglang 参数>` | — | `--` 之后的内容原样传给 `sglang.launch_server` |
 
 想看每个融合 kernel 内部各阶段各用了多久（torch profiler 只能看到 kernel 的起止，看不到里面）：
 
@@ -125,7 +145,7 @@ python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime
 ```
 
 只采指定的第 5 个 fused decode step（可改），并覆盖 kernel 入口到末尾的所有阶段；eager 和 decode graph 都支持。八张卡分别记录设备端时间，合并后导出 `<运行目录>/runtime/stage-timing.perfetto.json` 和各阶段耗时汇总。粒度到混音、投影、卷积、稀疏注意力选块、路由、专家、两处 all-reduce 等待等。
-kernel 入口时间由 kernel 内的设备端标记记录；`layer gdn/qsa` 从 attention kernel 的入口标记开始，在对应的 `post` kernel 最后一个 barrier 结束，不再用下一个 attention kernel 的开始时间代替结束时间。核内阶段现在拆成 block 0 到达下一 grid barrier 前的计算区间，以及单独轨道上的 `block 0 grid wait`；后者是 block 0 等待整个 grid 汇合的时间，不等于 GPU 全卡空闲时间。
+kernel 入口时间由 kernel 内的设备端标记记录；`layer gdn/qsa` 从 attention kernel 的入口标记开始，在对应的 `post` kernel 最后一个 barrier 结束，不再用下一个 attention kernel 的开始时间代替结束时间。核内阶段只画 block 0 到达下一个 grid barrier 之前的计算区间。block 0 在 barrier 里等其余 block 的时间（`block 0 grid wait`，不等于整卡空闲）从 11-15 起默认不放进合并后的 trace，所以时间轴上两段计算之间的空白就是等待；要看这些等待，合并时加 `--keep-idle`（见下文“设备端阶段计时与每 CU 计时”）。
 
 要把每一步 decode 的核内阶段直接放进完整 torch-profiler trace（与 GPU kernel 同一时间轴），用全量采集工具：
 
@@ -199,13 +219,26 @@ python3 tools/profile_flash_next_serving.py --mode both \
   --input-tokens 512 --output-tokens 64 --output-dir <目录>
 ```
 
-| 参数 | 说明 |
-|---|---|
-| `--mono-only` | 合并时只导出 monokernel 相关事件 → `inference.mono_only.json.gz`（校验仍用完整 trace）；要求 torch-profiler 采集且 `--mode monokernel` |
-| `--kernel-stages` | 嵌入每个被测 decode step 的设备端阶段 span；要求自启动的 monokernel torch-profiler 采集 |
-| `--hipprof` | 改用 hipprof 在 HIP 层采集（`.pftrace`），与 `--mono-only` 互斥 |
-| `--with-stack` / `--keep-python-functions` | 保留 python 调用栈 / python 函数事件 |
-| `--mode both` | native 和 monokernel 各启动一次，同目录对比 |
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--mode native\|monokernel\|both` | both | 采哪种模式；`both` 让 native 和 monokernel 各启动一次，输出到同一目录方便对比 |
+| `--input-tokens` / `--output-tokens` | 512 / 64 | 被测请求的输入 / 输出长度 |
+| `--batch-size 1\|2` | 1 | 被测请求数 |
+| `--warmup` | 2 | 正式采集前的预热轮数（不采集） |
+| `--decode-graph` | 关 | 只为被测 batch 捕获 decode graph |
+| `--mono-only` | 关 | 合并时只导出 monokernel 相关事件 → `inference.mono_only.json.gz`（校验仍用完整 trace）；要求 torch-profiler 采集且 `--mode monokernel` |
+| `--kernel-stages` | 关 | 把每个被测 decode step 的设备端阶段 span 嵌入 torch trace；要求自启动的 monokernel torch-profiler 采集 |
+| `--cu-stages` | 关 | 同时记录每个 CU 在每个时刻跑的是什么（每 CU 一行），采完自动合并成 `inference.perfetto.cu_stages.json.gz`（加 `--mono-only` 时为 `inference.mono_only.cu_stages.json.gz`），见下文 |
+| `--cu-steps N` | 1 | 配合 `--cu-stages`：记录几个 decode step，取值 1..输出数−1；每多一步每卡多约 66 MB JSON，建议 ≤ 4 |
+| `--hipprof` | 关 | 改用 hipprof 在 HIP 层采集（`.pftrace`），与 `--mono-only` 互斥 |
+| `--with-stack` / `--keep-python-functions` | 关 | 保留 python 调用栈 / python 函数事件 |
+| `--url` / `--host-event-dir` | — | 附加到已开 `SGLANG_AMD_PROFILE_RANGES=1` 的服务；后者是该服务配置的前端事件目录 |
+| `--port` | 30160 | 自己启动服务时的端口 |
+| `--model-path` | Flash-Next 快照 | 模型路径 |
+| `--output-dir` | `profiles/<时间>_<模式>_<选项>` | 输出目录 |
+| `--resume` | 关 | 往已有目录里补采缺少的模式，不覆盖已有结果 |
+| `--allow-busy-gpus` | 关 | 卡被占用时只警告，不退出 |
+| `--startup-timeout` | 1200 | 等服务启动的秒数 |
 
 输出在 `<目录>/{native,monokernel}/` 下，含 `inference.perfetto.json.gz`（或精简版）、`operators.csv`、`summary.json`、`manifest.json`、`README.md` 汇总表。
 
@@ -228,3 +261,95 @@ python3 tools/summarize_serving_profile.py --run-dir <目录>/monokernel --keep-
 | `--keep-python-functions` | 重建成保留 python 函数事件的完整版 |
 
 每次重导出会在 `<run-dir>/postprocess.json` 记录所用 `profile_trace.py` 的源码 SHA256 和选项，之前 summary 里的 shadow 状态、prompt 长度等字段会合并回去。
+
+## 设备端阶段计时与每 CU 计时（11-15 更新）
+
+torch profiler 只能看到融合 kernel 的起止。要看 kernel 内部，有两种设备端计时，都只对 Mono 生效，eager 和 decode graph 都支持：
+
+- **阶段计时**（`SGLANG_AMD_FLASH_STAGE_TIMING=1`）：只有 block 0 打点，得到“block 0 何时到达每个 grid barrier”，每卡一行。
+- **每 CU 计时**（再加 `SGLANG_AMD_FLASH_CU_TIMING=1`）：每个 block 都打点并记下所在的 CU，trace 里每个计算单元一行（`SE<se>.SH<sh>.CU<cu> (block <b>)`），能看出某一时刻每个 CU 在跑哪个算子。
+
+### 采集
+
+```bash
+# 方式 A：跑基准时顺带采（第 5 个 decode step；只要阶段计时就去掉 CU_TIMING）
+SGLANG_AMD_FLASH_STAGE_TIMING=1 SGLANG_AMD_FLASH_CU_TIMING=1 SGLANG_AMD_FLASH_STAGE_TIMING_STEP=5 \
+  SGLANG_AMD_FLASH_REPORT_DIR=<运行目录>/runtime \
+  python3 bench_flash_next.py --mode mono --graph --input-len 512 --output-len 64 --output-dir <运行目录>
+python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime
+
+# 方式 B：专用采集工具，采完自动合并（环境变量、buffer 大小和 watchdog 都由工具设置）
+python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --cu-stages --cu-steps 2 \
+  --input-tokens 512 --output-tokens 64 --output-dir <目录>
+```
+
+环境变量：
+
+| 变量 | 说明 |
+|---|---|
+| `SGLANG_AMD_FLASH_STAGE_TIMING=1` | 打开 block 0 阶段计时 |
+| `SGLANG_AMD_FLASH_CU_TIMING=1` | 打开每 CU 计时（与上一项共用时间基准，两组行在同一时间轴上对齐） |
+| `SGLANG_AMD_FLASH_STAGE_TIMING_STEP` | 从第几个 decode step 开始导出；0（默认）不自动导出 |
+| `SGLANG_AMD_FLASH_STAGE_TIMING_STEPS` | 导出几个 step |
+| `SGLANG_AMD_FLASH_STAGE_TIMING_RECORDS` / `SGLANG_AMD_FLASH_CU_TIMING_RECORDS` | 记录 buffer 大小；CU 默认 8192 条/ block，约两个 step（每步每 block 约 3150 条），超了会在结果里标 `dropped` |
+| `SGLANG_AMD_FLASH_REPORT_DIR` | 原始 `stage-timing-*-rank-*.json` / `cu-timing-*-rank-*.json` 的写出目录 |
+
+注意事项：
+- 一个 64 token 的请求只有 63 个 decode step，`--cu-steps` 最多填输出数 − 1，填满会什么都导不出来。
+- 导出在调度进程里同步进行，步数多时很慢（32 步约 7 分钟、每卡 2.1 GB）。手动启动服务时要自己加大 `--watchdog-timeout`（工具会自动传 `max(300, 60·N)`），否则 SGLang 的 300 秒 watchdog 会把服务杀掉，客户端只看到 `Connection refused`。
+- 每 CU 计时每步每卡约 25 万个 span，打开整个 trace 很吃内存，一次采 1–4 步就够。
+
+### 合并（`tools/merge_flash_next_stage_timing.py`）
+
+八张卡各用自己的时钟打点，合并时用跨卡 all-reduce 最后一个 `peer wait` 的释放时刻（每步约 99 对）拟合出每张卡相对 rank 0 的偏移和漂移，把所有行对齐到 rank 0 的时钟上。实测残差中位数约 0.3 us、最大 1.7 us，**跨卡相差 2 us 以内的差异当作噪声**。
+
+**合并后的 trace 默认只保留计算区间**：每 CU 行上的 `wait ...`（barrier 等待）、`gap ...`（两次 launch 之间的空闲），以及阶段行上的 `block 0 grid wait` 都不导出，所以一行上的空白就是等待或空闲。这些等待只是不画出来，对齐、跨卡检查和汇总里的 compute / wait / gap 合计照样用它们计算。`merge_profiles` 嵌入 torch trace 的核内阶段（`--kernel-stages`）同样默认不带 `block 0 grid wait`。
+
+有每 CU 数据时，合并结果还会在每个 rank 下增加 `grid (all CUs)` 轨道：对每个 `(step, layer, kernel, stage)`，用最早 block 计算开始到最晚 block 到达 barrier 的时间范围。它补足只记录 block 0 的 device-stage 算子行看不到其他 block 尾部工作的限制；例如 block 0 先到 barrier 后等待的时间，会落在 grid 范围行而不是 block 0 的计算行上。`args.blocks` 是参与该范围的 block 数，`median_arrival_us` 是从范围起点到 block 中位到达时间的偏移。用 `--no-grid` 可关闭该轨道；其范围只表示 block 到达 barrier，不包含 barrier 释放后的等待。
+
+```bash
+python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime                # 默认：只有计算区间
+python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime --keep-idle    # 加回 wait / gap span
+python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime --steps 1-4    # 多步采集只保留其中几步
+python3 tools/merge_flash_next_stage_timing.py --run-dir <运行目录>/runtime --no-grid     # 不生成 grid (all CUs) 轨道
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--run-dir` | 必填 | 含 `stage-timing-*-rank-*.json` 的目录 |
+| `--output` | `<run-dir>/stage-timing.perfetto.json`（有 CU 数据时为 `.json.gz`） | 合并后的 Perfetto 文件 |
+| `--summary` | `<run-dir>/stage-timing-summary.json` | 汇总：每阶段耗时、对齐结果（`alignment`）、每 CU 的 compute / wait / gap 合计（`compute_units`） |
+| `--no-cu` | 关 | 有 `cu-timing-*` 也不合并每 CU 行 |
+| `--steps 5` / `3-6` / `1,4-5` | 全部 | 每 CU 数据只保留这几个 decode step（从 1 开始数，阶段行全保留）；32 步只留 4 步约 253 MB、13 分钟 |
+| `--gzip` | 关 | 没有 CU 数据时也输出 `.gz` |
+| `--align fit\|offset\|none` | fit | 对齐方式：偏移 + 漂移 / 只偏移 / 不对齐（各卡保留原始时钟，只能比较时长） |
+| `--keep-idle` | 关 | 把 barrier 等待和 launch 间空闲也导出成 span |
+| `--no-grid` | 关 | 不生成基于每 CU 计算区间的 `grid (all CUs)` 轨道 |
+
+终端会打印对齐结果、所有 CU 的计算 / 等待 / 空闲合计，以及最受 barrier 限制和最受计算限制的 5 个 CU。
+
+在 Python 里调用时对应的开关是 `merge(..., keep_idle=True)` 和 `merge_profiles(..., keep_device_waits=True)`。
+
+### 读 trace
+
+- 每 CU 行上的 span 名形如 `layer 12 gdn: conv state`，`args` 里有 block、step、layer、kernel、stage、CU。
+- 一个 block 在同一次 launch 内不会换 CU，但下一次 launch 可能被放到别的 CU 上，所以同一行会先后出现多个 block（汇总里的 `shared_units`），这是正常的；launch 内换 CU 的次数记在 `migrated_launch_count`，目前实测为 0。
+- 每 CU 行是单独的 Perfetto 文件，不在 torch-profiler 合并 trace（`inference.perfetto.json.gz`）里。
+
+### 设备自检（不加载模型，单卡约 1 秒）
+
+改过 `kernel.cpp` 后跑一次，确认 CU 分布、打点顺序和有无丢失：
+
+```bash
+python3 tools/verify_flash_next_cu_timing.py --device 0 --launches 4
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--device` | 0 | 用哪张卡 |
+| `--launches` | 4 | 跑几次 `hc_mix` |
+| `--rows 1\|2` | 1 | decode 行数 |
+| `--records` | 1024 | 每 block 的记录容量 |
+| `--output-dir` | — | 写出 Perfetto trace 和报告 |
+
+11-13 在 card 0 上：80 个 block 落在 80 个不同的 CU 上，每 block 36 个打点，没有丢失；`hc_mix` 每次 launch 每个 CU 约 23 us 在算、约 361 us 在 grid barrier 里等。

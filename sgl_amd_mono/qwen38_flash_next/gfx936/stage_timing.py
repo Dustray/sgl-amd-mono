@@ -2,7 +2,10 @@
 
 Every grid barrier records block 0's arrival and release timestamps (`kernel.cpp:grid_sync`).
 Stage numbers are unique per kernel kind, so a flat record stream is enough to rebuild which
-stage of which launch ran when. Compute and block-0 grid-wait intervals use separate tracks:
+stage of which launch ran when. A segment span runs from the previous barrier release to this
+barrier's release, which every block must reach first, so its duration is the whole grid's time
+for that stage even though only block 0 records; block 0's own compute and wait are in its args
+(`block0_compute_us`, `block0_wait_us`), and the block-0 wait is also a depth-4 child span:
 
 | stage | kernel | stage | kernel |
 |---|---|---|---|
@@ -35,6 +38,8 @@ KINDS = (
 )
 START_STAGE = {"hc_mix": 700, "post": 701, "gdn": 702, "qsa": 703, "ple": 704, "entry": 705, "tail": 706}
 SYNC_ARRIVAL_OFFSET = 1000
+# Segment spans run barrier release -> release, so they are whole-grid times, not block 0's compute.
+STAGE_THREAD = "decode steps (stage = all blocks, release to release)"
 
 # The barrier a segment *ends* at names the work done before it.
 SEGMENTS = {
@@ -181,7 +186,7 @@ def export_trace(records, path, clock_khz, rank, dropped=False, labels=None, bas
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     events = [{"ph": "M", "name": "process_name", "pid": rank, "tid": 0, "args": {"name": f"rank {rank} (device stages)"}},
-              {"ph": "M", "name": "thread_name", "pid": rank, "tid": 1, "args": {"name": "decode steps"}}]
+              {"ph": "M", "name": "thread_name", "pid": rank, "tid": 1, "args": {"name": STAGE_THREAD}}]
     ticks_per_us = clock_khz / 1000.0
     step, layer, step_open, layer_open = 0, 0, None, None
     summary = []
@@ -207,11 +212,28 @@ def export_trace(records, path, clock_khz, rank, dropped=False, labels=None, bas
             events.append(_span(rank, 1, f"layer {layer} {layer_open['kind']}",
                                 layer_open["start"], last, base, ticks_per_us))
             layer_open = None
-        for phase, name, stage, start, end in walk(launch):
+        segments = list(walk(launch))
+        for position, (phase, name, stage, start, end) in enumerate(segments):
             if phase == "grid_wait":
                 events.append(_span(rank, 1, f"{name} / block 0 grid wait", start, end, base, ticks_per_us, depth_extra=4))
                 summary.append({"kind": launch["kind"], "stage": stage, "segment": name,
                                 "phase": "block0_grid_wait", "us": (end - start) / ticks_per_us})
+                continue
+            following = segments[position + 1] if position + 1 < len(segments) else None
+            if phase == "compute" and following is not None and following[0] == "grid_wait":
+                # The segment span covers the whole grid: previous release -> this barrier's release,
+                # i.e. until the slowest block arrived. Block 0's own compute/wait split goes to args;
+                # a span ending at block 0's arrival read as "all CUs" and understated the stage
+                # (layer 8 gdn mix.down: block 0 235 us, last block 273 us, 2026-11-16).
+                release = following[4]
+                span = _span(rank, 1, name, start, release, base, ticks_per_us, depth_extra=3)
+                if span is not None:
+                    span["args"].update({"span": "barrier release to release (all blocks)",
+                                         "block0_compute_us": (end - start) / ticks_per_us,
+                                         "block0_wait_us": (release - end) / ticks_per_us})
+                events.append(span)
+                summary.append({"kind": launch["kind"], "stage": stage, "segment": name,
+                                "phase": "compute", "us": (end - start) / ticks_per_us})
                 continue
             events.append(_span(rank, 1, name, start, end, base, ticks_per_us, depth_extra=3))
             summary.append({"kind": launch["kind"], "stage": stage, "segment": name,

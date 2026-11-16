@@ -92,12 +92,32 @@ def test_export_layout(tmp_path):
     assert len(result["segments"]) == len(records) - launches_per_step * 2
 
     # 100 ticks at 1 GHz = 0.1 us; the check pins the tick->time conversion.
+    # The segment span runs release to release (whole grid); block 0's split is in its args.
     first_segment = next(event for event in spans if event["name"] == "mix.normalize")
-    assert first_segment["dur"] == pytest.approx(0.1, rel=1e-6)
     first_wait = next(event for event in spans if event["name"] == "mix.normalize / block 0 grid wait")
     assert first_wait["dur"] == pytest.approx(0.1, rel=1e-6)
-    assert first_segment["ts"] + first_segment["dur"] == pytest.approx(first_wait["ts"])
     assert first_wait["args"]["depth"] == 4
+    assert first_segment["dur"] == pytest.approx(0.2, rel=1e-6)
+    assert first_segment["args"]["block0_compute_us"] == pytest.approx(0.1, rel=1e-6)
+    assert first_segment["args"]["block0_wait_us"] == pytest.approx(0.1, rel=1e-6)
+    assert first_segment["ts"] + first_segment["dur"] == pytest.approx(first_wait["ts"] + first_wait["dur"])
+    compute = [row for row in result["segments"] if row["segment"] == "mix.normalize" and row["phase"] == "compute"]
+    assert compute[0]["us"] == pytest.approx(0.1, rel=1e-6)
+
+
+def test_widen_segments_upgrades_block0_arrival_spans():
+    from sgl_amd_mono.common.profile_trace import widen_segments
+    spans = [{"ph": "X", "name": "gdn", "ts": 0.0, "dur": 400.0, "args": {"depth": 2}},
+             {"ph": "X", "name": "mix.down", "ts": 10.0, "dur": 235.2, "args": {"depth": 3}},
+             {"ph": "X", "name": "mix.down / block 0 grid wait", "ts": 245.2, "dur": 37.8, "args": {"depth": 4}},
+             {"ph": "X", "name": "mix.up", "ts": 283.0, "dur": 20.0, "args": {"depth": 3}}]
+    widen_segments(spans)
+    assert spans[1]["dur"] == pytest.approx(273.0)
+    assert spans[1]["args"]["block0_compute_us"] == pytest.approx(235.2)
+    assert spans[1]["args"]["block0_wait_us"] == pytest.approx(37.8)
+    assert spans[3]["dur"] == 20.0 and "block0_compute_us" not in spans[3]["args"]
+    widen_segments(spans)  # idempotent
+    assert spans[1]["dur"] == pytest.approx(273.0)
 
 
 def test_zero_length_spans_are_dropped(tmp_path):

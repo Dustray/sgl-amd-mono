@@ -23,6 +23,8 @@ import json
 from pathlib import Path
 import statistics
 
+from sgl_amd_mono.common.profile_trace import widen_segments
+
 
 def load(directory, pattern="stage-timing-*-rank-*.json", progress=None):
     traces = []
@@ -32,7 +34,7 @@ def load(directory, pattern="stage-timing-*-rank-*.json", progress=None):
             progress(f"stage-timing: reading {path.name} ({index}/{len(paths)})")
         trace = json.loads(path.read_text())
         rank = int(path.stem.rsplit("-", 1)[1])
-        traces.append((rank, path, [event for event in trace["traceEvents"] if event.get("ph") == "X"]))
+        traces.append((rank, path, widen_segments([event for event in trace["traceEvents"] if event.get("ph") == "X"])))
     if not traces:
         raise FileNotFoundError(f"No stage timing traces in {directory}")
     return traces
@@ -101,9 +103,50 @@ def fill_cu_gaps(events):
     return passthrough + filled
 
 
+GRID_TID = 2
+
+
+def grid_spans(events, pid):
+    """One span per (launch, segment) covering every block: earliest start -> latest barrier arrival.
+
+    The block-0 stage row only shows block 0's own compute, which ends when block 0 reaches the
+    barrier even if other blocks are still working (e.g. layer 0 gdn mix.down, 2026-11-15: block 0
+    arrived at 9681 us, block 3 at 9713 us). This row is what "first CU start to last CU end" means.
+    Occurrences are numbered per block in time order, so a segment repeated within one
+    (step, layer, kernel) still pairs up across blocks."""
+    per_block = {}
+    for event in events:
+        if event.get("ph") == "X" and event.get("cat") == "cu_compute":
+            per_block.setdefault(event["args"].get("block"), []).append(event)
+    groups = {}
+    for spans in per_block.values():
+        spans.sort(key=lambda event: event["ts"])
+        seen = {}
+        for event in spans:
+            args = event["args"]
+            key = (args.get("step"), args.get("layer"), args.get("kernel"), args.get("stage"))
+            occurrence = seen.get(key, 0)
+            seen[key] = occurrence + 1
+            groups.setdefault((*key, occurrence), []).append(event)
+    out = []
+    for (step, layer, kernel, stage, _), spans in groups.items():
+        start = min(event["ts"] for event in spans)
+        last = max(spans, key=lambda event: event["ts"] + event["dur"])
+        end = last["ts"] + last["dur"]
+        arrivals = sorted(event["ts"] + event["dur"] for event in spans)
+        out.append({"ph": "X", "cat": "grid_stage", "name": spans[0]["name"], "pid": pid, "tid": GRID_TID,
+                    "ts": start, "dur": end - start,
+                    "args": {"tp_rank": spans[0]["args"].get("tp_rank"), "step": step, "layer": layer, "kernel": kernel,
+                             "stage": stage, "blocks": len(spans), "last_block": last["args"].get("block"),
+                             "last_cu": last["args"].get("cu"), "median_arrival_us": arrivals[len(arrivals) // 2] - start}})
+    out.sort(key=lambda event: event["ts"])
+    return out
+
+
 # Final `peer wait` of each cross-rank all-reduce/gather: released only once every rank has signalled.
 SYNC_SEGMENTS = ("tp.peer wait", "attn.peer wait", "moe.peer wait", "embed.peer wait", "gather.peer wait")
 SYNC_STAGES = (614, 14, 54, 514, 634)
+STAGE_THREAD = "decode steps (stage = all blocks, release to release)"
 WAIT_SUFFIX = " / block 0 grid wait"
 LAUNCH_DEPTH = 2
 
@@ -224,8 +267,18 @@ def check_cu_alignment(cu_traces, fits, shift=0.0):
     return report
 
 
-def merge(traces, output, cu_traces=(), align_mode="fit", progress=None):
-    """Write the merged Perfetto file; returns the alignment report ({} with align_mode="none")."""
+def is_idle(event):
+    """Barrier waits and launch gaps: block-0 grid waits and per-CU `cu_wait` / `cu_gap` spans."""
+    return event.get("cat") in ("cu_wait", "cu_gap") or event.get("name", "").endswith(WAIT_SUFFIX)
+
+
+def merge(traces, output, cu_traces=(), align_mode="fit", progress=None, keep_idle=False, grid=True):
+    """Write the merged Perfetto file; returns the alignment report ({} with align_mode="none").
+
+    By default the exported trace holds compute spans only: waits and gaps are left out (empty
+    time on a row is then wait or idle). Alignment, the per-CU check and the summaries still use
+    them from the inputs; `keep_idle=True` exports them too. With per-CU traces, `grid=True` adds a
+    `grid (all CUs)` track under each rank's stage process (see `grid_spans`)."""
 
     def report(message):
         if progress is not None:
@@ -244,12 +297,18 @@ def merge(traces, output, cu_traces=(), align_mode="fit", progress=None):
     events = []
     for rank, _, spans in traces:
         events.append({"ph": "M", "name": "process_name", "pid": rank, "tid": 0, "args": {"name": f"rank {rank} (device stages)"}})
-        events.append({"ph": "M", "name": "thread_name", "pid": rank, "tid": 1, "args": {"name": "decode steps"}})
+        events.append({"ph": "M", "name": "thread_name", "pid": rank, "tid": 1, "args": {"name": STAGE_THREAD}})
+        spans = spans if keep_idle else [event for event in spans if not is_idle(event)]
         events.extend(_apply(spans, fits[rank], shift) if rank in fits else spans)
     for rank, _, cu_events in cu_traces:
         report(f"applying clock alignment to rank {rank} per-CU events")
+        cu_events = cu_events if keep_idle else [event for event in cu_events if not is_idle(event)]
         cu_events = _apply(cu_events, fits[rank], shift) if rank in fits else cu_events
-        events.extend(fill_cu_gaps(cu_events))
+        if grid:
+            events.append({"ph": "M", "name": "thread_name", "pid": rank, "tid": GRID_TID,
+                           "args": {"name": "grid (all CUs): first block start -> last block arrival"}})
+            events.extend(grid_spans(cu_events, rank))
+        events.extend(fill_cu_gaps(cu_events) if keep_idle else cu_events)
     # Stream, and gzip at level 1: joining ~65M events (32 CU steps x 8 ranks) into one string and
     # compressing it at the default level 9 ran for well over 10 minutes with 0 bytes written (2026-11-14).
     output = Path(output)
@@ -327,6 +386,8 @@ def main():
     parser.add_argument("--gzip", action="store_true", help="force a .gz output even without per-CU traces")
     parser.add_argument("--align", choices=("fit", "offset", "none"), default="fit",
                         help="map every rank onto rank 0's clock via cross-rank peer-wait releases: offset + drift (fit, default), offset only, or keep raw per-rank clocks (none)")
+    parser.add_argument("--no-grid", action="store_true", help="skip the per-rank 'grid (all CUs)' track (earliest block start -> latest arrival per segment, from the per-CU traces)")
+    parser.add_argument("--keep-idle", action="store_true", help="also export barrier-wait and idle-gap spans (default: compute spans only; totals are still in the summary)")
     arguments = parser.parse_args()
     directory = arguments.run_dir.resolve()
     traces = load(directory)
@@ -334,7 +395,7 @@ def main():
     default_name = "stage-timing.perfetto.json.gz" if (cu_traces or arguments.gzip) else "stage-timing.perfetto.json"
     output = arguments.output or directory / default_name
     summary = arguments.summary or directory / "stage-timing-summary.json"
-    alignment = merge(traces, output, cu_traces, arguments.align)
+    alignment = merge(traces, output, cu_traces, arguments.align, keep_idle=arguments.keep_idle, grid=not arguments.no_grid)
     rows = summarize(traces)
     cu_rows = summarize_cu(cu_traces)
     summary.write_text(json.dumps({"ranks": [rank for rank, _, _ in traces], "alignment": alignment, "segments": rows,

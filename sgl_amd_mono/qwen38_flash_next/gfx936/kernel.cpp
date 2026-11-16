@@ -118,7 +118,10 @@ __device__ __forceinline__ unsigned int hardware_id() {
 #endif
 }
 
-__device__ __forceinline__ void cu_mark(unsigned int stage) {
+// `ticks` is read once by stage_mark and shared with the block-0 stage record, so both streams
+// carry the identical timestamp for the same mark (a second wall_clock64() after the stage
+// buffer's global atomicAdd ran 1-2 us late, 2026-11-15).
+__device__ __forceinline__ void cu_mark(unsigned int stage, int64_t ticks) {
     int64_t records = cu_records;
     if (cu_buffer == nullptr || records < 1 || threadIdx.x != 0) return;
     int64_t* region = cu_buffer + 2 + static_cast<int64_t>(blockIdx.x) * (1 + 3 * records);
@@ -130,12 +133,14 @@ __device__ __forceinline__ void cu_mark(unsigned int stage) {
     volatile int64_t* record = region + 1 + cursor * 3;
     record[0] = static_cast<int64_t>(stage);
     record[2] = static_cast<int64_t>(hardware_id());
-    record[1] = static_cast<int64_t>(wall_clock64());
+    record[1] = ticks;
     region[0] = cursor + 1;
 }
 
 __device__ __forceinline__ void stage_mark(unsigned int stage) {
-    cu_mark(stage);
+    if (threadIdx.x != 0 || (cu_buffer == nullptr && stage_buffer == nullptr)) return;  // timing off: no clock read
+    const int64_t ticks = static_cast<int64_t>(wall_clock64());
+    cu_mark(stage, ticks);
     int64_t capacity = stage_capacity;
     if (stage_buffer == nullptr || capacity < 4 || blockIdx.x != 0 || threadIdx.x != 0) return;
     unsigned long long index = atomicAdd(reinterpret_cast<unsigned long long*>(stage_buffer), 1ull);
@@ -145,7 +150,7 @@ __device__ __forceinline__ void stage_mark(unsigned int stage) {
     }
     volatile int64_t* record = stage_buffer + 2 + index * 2;
     record[0] = static_cast<int64_t>(stage);
-    record[1] = static_cast<int64_t>(wall_clock64());
+    record[1] = ticks;
 }
 
 __device__ __forceinline__ bool grid_sync(unsigned int* state, int64_t timeout, unsigned int stage) {

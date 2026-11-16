@@ -137,7 +137,7 @@ def test_mismatched_captures_are_refused():
 def test_merged_trace_lines_up_across_ranks(tmp_path):
     traces, cu_traces = build(true_timeline(steps=2), jitter=2.0)
     output = tmp_path / "merged.json.gz"
-    report = merge(traces, output, cu_traces)
+    report = merge(traces, output, cu_traces, keep_idle=True)
     events = json.loads(gzip.open(output, "rt").read())["traceEvents"]
     spans = [event for event in events if event.get("ph") == "X"]
     assert min(event["ts"] for event in spans) == pytest.approx(0.0, abs=1e-6)
@@ -160,3 +160,44 @@ def test_align_none_keeps_raw_clocks(tmp_path):
     events = json.loads((tmp_path / "raw.json").read_text())["traceEvents"]
     rank3 = [event["ts"] for event in events if event.get("pid") == 3 and event.get("ph") == "X"]
     assert min(rank3) > 3_000_000
+
+
+def test_merge_leaves_waits_and_gaps_out_by_default(tmp_path):
+    traces, cu_traces = build(true_timeline(steps=1))
+    report = merge(traces, tmp_path / "compute.json", cu_traces)
+    events = json.loads((tmp_path / "compute.json").read_text())["traceEvents"]
+    spans = [event for event in events if event.get("ph") == "X"]
+    assert spans and not any(event.get("cat") in ("cu_wait", "cu_gap") for event in spans)
+    assert not any(event["name"].endswith("block 0 grid wait") for event in spans)
+    # Alignment still uses the waits from the inputs.
+    assert all(row["max_us"] < 1e-3 for row in report["cu_check"].values())
+
+
+def test_grid_spans_cover_every_block():
+    from tools.merge_flash_next_stage_timing import grid_spans
+
+    def span(block, ts, dur, stage=301, step=1):
+        return {"ph": "X", "cat": "cu_compute", "name": "layer 0 gdn: mix.down", "pid": 100, "tid": block + 1,
+                "ts": ts, "dur": dur, "args": {"tp_rank": 0, "block": block, "cu": f"CU{block}", "step": step,
+                                               "layer": 0, "kernel": "gdn", "stage": stage, "phase": "compute"}}
+
+    events = [span(0, 10.0, 260.0), span(1, 9.0, 2.0), span(3, 11.0, 300.0),
+              {"ph": "X", "cat": "cu_wait", "name": "wait mix.down", "pid": 100, "tid": 1, "ts": 270.0, "dur": 45.0,
+               "args": {"block": 0, "step": 1, "layer": 0, "kernel": "gdn", "stage": 301}},
+              span(0, 500.0, 5.0, step=2), span(1, 501.0, 7.0, step=2)]
+    spans = grid_spans(events, pid=0)
+    assert [(event["ts"], event["dur"], event["args"]["blocks"]) for event in spans] == [(9.0, 302.0, 3), (500.0, 8.0, 2)]
+    assert spans[0]["args"]["last_block"] == 3 and spans[0]["tid"] == 2 and spans[0]["pid"] == 0
+
+
+def test_merge_adds_grid_track(tmp_path):
+    traces, cu_traces = build(true_timeline(steps=1))
+    # The fixture only carries peer waits; add a compute span before each one.
+    cu_traces = [(rank, path, events + [dict(event, cat="cu_compute", name="compute", ts=event["ts"] - 3.0, dur=3.0)
+                                        for event in events if event.get("cat") == "cu_wait"])
+                 for rank, path, events in cu_traces]
+    merge(traces, tmp_path / "grid.json", cu_traces)
+    events = json.loads((tmp_path / "grid.json").read_text())["traceEvents"]
+    assert any(event.get("cat") == "grid_stage" and event["pid"] == 0 for event in events)
+    merge(traces, tmp_path / "nogrid.json", cu_traces, grid=False)
+    assert not any(event.get("cat") == "grid_stage" for event in json.loads((tmp_path / "nogrid.json").read_text())["traceEvents"])
