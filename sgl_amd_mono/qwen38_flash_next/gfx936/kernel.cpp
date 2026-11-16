@@ -96,6 +96,52 @@ __device__ __forceinline__ float wave_sum(float value) {
     return __shfl(value, 0, 64);
 }
 
+// One wave selects the top-10 experts of one row. Same result as the former single-thread scan:
+// maximum over all logits (fmaxf), then 10 rounds of "largest remaining value, ties to the lowest
+// expert id, strict > from -inf" (so -inf/NaN are never picked and best stays -1 if nothing is
+// left), probabilities expf(value - maximum) summed in selection order and divided by the total.
+// Lane l owns experts l + 64 * j, j = 0..7 (ascending ids inside a lane).
+__device__ __forceinline__ void router_topk(const BFloat16* logits, int* top_ids, float* top_weights, int row) {
+    constexpr int PerLane = Experts / 64;
+    int lane = threadIdx.x & 63;
+    float values[PerLane];
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < PerLane; ++j) {
+        values[j] = float(logits[row * Experts + lane + 64 * j]);
+        maximum = fmaxf(maximum, values[j]);
+    }
+    for (int offset = 32; offset > 0; offset /= 2) maximum = fmaxf(maximum, __shfl_xor(maximum, offset, 64));
+    unsigned int used = 0u;
+    float probabilities[Topk];
+    float total = 0.0f;
+#pragma unroll
+    for (int selected = 0; selected < Topk; ++selected) {
+        float value = -INFINITY;
+        int best = -1;
+#pragma unroll
+        for (int j = 0; j < PerLane; ++j) {
+            if (!(used & (1u << j)) && values[j] > value) { value = values[j]; best = lane + 64 * j; }
+        }
+        for (int offset = 32; offset > 0; offset /= 2) {
+            float other_value = __shfl_xor(value, offset, 64);
+            int other_best = __shfl_xor(best, offset, 64);
+            if (other_value > value || (other_value == value && other_best >= 0 && (best < 0 || other_best < best))) {
+                value = other_value;
+                best = other_best;
+            }
+        }
+        if (best >= 0 && (best & 63) == lane) used |= 1u << (best >> 6);
+        probabilities[selected] = expf(value - maximum);
+        total += probabilities[selected];
+        if (lane == 0) top_ids[row * Topk + selected] = best;
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int selected = 0; selected < Topk; ++selected) top_weights[row * Topk + selected] = probabilities[selected] / total;
+    }
+}
+
 // Device-side stage timing. The host attaches one int64 buffer per rank; grid_sync records
 // the block-0 arrival and release timestamps for each barrier.
 // Layout: [0] cursor, [1] dropped flag, [2 + 2n] = stage, [3 + 2n] = ticks.
@@ -237,6 +283,64 @@ __device__ __forceinline__ void normalize(const BFloat16* input, const BFloat16*
             float value = float(input[offset + column]);
             output[offset + column] = BFloat16(value * inverse * (1.0f + float(weight[(task % Branches) * Hidden + column])));
         }
+    }
+}
+
+// One 16-output tile of a K = Hidden gemv, computed by one wave with loads issued ahead of the MMACs.
+// matvec16 issues one load per 16 columns and then waits for it, i.e. 160 dependent memory round
+// trips per tile. Here the wave loads the next 128 columns while it multiplies the current ones
+// (double buffer). One accumulator is still chained over all of K in the same step order and with
+// the same operands as matvec16(split_k=0), so the result is bit-identical. Lanes < 16 return the
+// tile's outputs; rows >= valid read as zero weights, as in matvec16.
+constexpr int PipeChunk = 128;
+constexpr int PipeSteps = PipeChunk / 16;
+constexpr int PipeChunks = Hidden / PipeChunk;
+
+__device__ __forceinline__ float matvec16_pipelined(const BFloat16* input, const BFloat16* weight, int valid = 16) {
+    int lane = threadIdx.x & 63;
+    int column = (lane / 16) * 4;
+    bool has_row = lane % 16 < valid;
+    bool has_input = lane % 16 == 0;
+    const BFloat16* source = input + column;
+    const BFloat16* rows_weight = weight + int64_t(lane % 16) * Hidden + column;
+    Short4 left[2][PipeSteps];
+    Short4 right[2][PipeSteps];
+#pragma unroll
+    for (int step = 0; step < PipeSteps; ++step) {
+        left[0][step] = has_row ? *reinterpret_cast<const Short4*>(rows_weight + step * 16) : Short4{0, 0, 0, 0};
+        right[0][step] = has_input ? *reinterpret_cast<const Short4*>(source + step * 16) : Short4{0, 0, 0, 0};
+    }
+    Float4 accumulator = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int chunk = 0; chunk < PipeChunks; ++chunk) {
+        int current = chunk & 1;
+        if (chunk + 1 < PipeChunks) {
+            int offset = (chunk + 1) * PipeChunk;
+#pragma unroll
+            for (int step = 0; step < PipeSteps; ++step) {
+                left[current ^ 1][step] = has_row ? *reinterpret_cast<const Short4*>(rows_weight + offset + step * 16) : Short4{0, 0, 0, 0};
+                right[current ^ 1][step] = has_input ? *reinterpret_cast<const Short4*>(source + offset + step * 16) : Short4{0, 0, 0, 0};
+            }
+        }
+#pragma unroll
+        for (int step = 0; step < PipeSteps; ++step) accumulator = __builtin_hcu_mmac_f32_16x16x16_bf16(left[current][step], right[current][step], accumulator);
+    }
+    return accumulator[0];
+}
+
+// Router gemv (2560 -> 512 BF16 logits). 512 / 16 = 32 tiles, so only 32 waves (blocks 0-7) work
+// (~64 us per layer with matvec16, 2026-11-16). Split-K across waves would spread the work over
+// more CUs but changes the rounding of the router logits.
+constexpr int RouterTiles = Experts / 16;
+
+__device__ __forceinline__ void router_gemv(const BFloat16* input, const BFloat16* weight, BFloat16* output, int rows) {
+    int wave = blockIdx.x * 4 + threadIdx.x / 64;
+    int lane = threadIdx.x & 63;
+    for (int task = wave; task < rows * RouterTiles; task += Blocks * 4) {
+        int row = task / RouterTiles;
+        int base = task % RouterTiles * 16;
+        float value = matvec16_pipelined(input + row * Hidden, weight + int64_t(base) * Hidden);
+        if (lane < 16) output[row * Experts + base + lane] = BFloat16(value);
     }
 }
 
@@ -426,29 +530,10 @@ __global__ __launch_bounds__(Threads, 1) void post_attention(PostArguments args)
     if (!inject(args.reduced_attention, args.residual, args.normalized_residual, args.attention_inject, args.inject_gates, args.post_attention, args.rows, args.sync, 20)) return;
     MixArguments mix{args.post_attention, args.norm_weight, args.mix_down, args.mix_up, args.normalized, args.lowrank, args.gates, args.partials, args.mixed, args.sync.state, args.executions, args.rows, args.sync.timeout_ticks};
     if (!run_mix(mix, 30)) return;
-    gemv(args.mixed, args.router_weight, args.router_logits, nullptr, args.rows, Hidden, Experts, 0);
+    router_gemv(args.mixed, args.router_weight, args.router_logits, args.rows);
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 40)) return;
-    if (blockIdx.x == 0 && threadIdx.x < args.rows) {
-        int row = threadIdx.x;
-        float maximum = -INFINITY;
-        for (int expert = 0; expert < Experts; ++expert) maximum = fmaxf(maximum, float(args.router_logits[row * Experts + expert]));
-        float total = 0.0f;
-        for (int selected = 0; selected < Topk; ++selected) {
-            int best = -1;
-            float value = -INFINITY;
-            for (int expert = 0; expert < Experts; ++expert) {
-                bool used = false;
-                for (int previous = 0; previous < selected; ++previous) used |= args.top_ids[row * Topk + previous] == expert;
-                float candidate = float(args.router_logits[row * Experts + expert]);
-                if (!used && candidate > value) { value = candidate; best = expert; }
-            }
-            args.top_ids[row * Topk + selected] = best;
-            float probability = expf(value - maximum);
-            args.top_weights[row * Topk + selected] = probability;
-            total += probability;
-        }
-        for (int selected = 0; selected < Topk; ++selected) args.top_weights[row * Topk + selected] /= total;
-    }
+    // Top-10 routing: wave 0 of block 1 + row (the shared-gate gemv below runs on block 0's waves).
+    if (blockIdx.x >= 1 && blockIdx.x <= args.rows && threadIdx.x < 64) router_topk(args.router_logits, args.top_ids, args.top_weights, blockIdx.x - 1);
     gemv(args.mixed, args.shared_gate_weight, nullptr, args.inject_gates + args.rows * Branches, args.rows, Hidden, 1, 0);
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 41)) return;
     int wave = blockIdx.x * 4 + threadIdx.x / 64;
