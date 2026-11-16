@@ -121,7 +121,7 @@ class QSAAttention:
             raise FlashContractError("QSA cache capacity or device mismatch")
         output = torch.empty((rows, 2560), dtype=torch.bfloat16, device=self.device)
         mixed = self.mixed[:rows]
-        mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, mixed, self.mixer.state, self.mixer.executions)
+        mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, self.mixer.partials, mixed, self.mixer.state, self.mixer.executions)
         mix = MixArguments(*(tensor.data_ptr() for tensor in mix_tensors), rows, self.mixer.program.timeout_ticks)
         tensors = (*self.weights, self.rotary_cache, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed, self.projected, self.index_projected, self.queries, self.index_queries, self.index_scores, self.selected, self.attention_scores, self.core, output, self.executions)
         arguments = QSAArguments(mix, *(tensor.data_ptr() for tensor in tensors), request_tokens.stride(0), request_tokens.shape[0], key.shape[0] * 64, ring.shape[0], self.rotary_cache.shape[0], axes, 0 if axes == 1 else positions.stride(0), key.stride(0), key.stride(1), key.stride(3), value.stride(0), value.stride(1), value.stride(3))

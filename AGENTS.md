@@ -248,6 +248,17 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --outp
   Full 20-case native+graph data: `bench_results/20261110_native_graph_{grid,16-1024,b2_2048_rerun}/`.
 - Latest numbers and how they were measured: `Flash-Next 性能对比.md`.
 
+## HC mix.down split-K (2026-11-16)
+
+`run_mix` (`kernel.cpp`, used by hc_mix, post, gdn, qsa, tail) used to run mix.down (10240→320) as a plain
+`gemv`: rows × 20 tiles = 20 waves = blocks 0-4 each walking all 640 K steps, 75 blocks parked in the barrier
+(that is why a few CUs looked very long in the per-CU trace). Now `mix_down_partials` splits it into
+tile × 256-column chunk tasks (800 at b1, every wave busy, loads issued before the MMACs) writing FP32 partials
+to `partials [2, 40, 320]` (new `MixArguments`/`PostArguments` field, after `gates`), and after the barrier every
+block sums the 40 chunks in order into LDS (`mix_down_reduce`) and feeds mix.up from there. Sum order equals
+`matvec16(split_k=256)`, so results are **bit-identical** to before (72/72 tensors: output, lowrank, gates, 4 layers,
+b1/b2). Standalone `hc_mix`: 340-360 → 91 us (b1), 111 us (b2). Passing: `verify_flash_next_{hc,gdn,qsa,io,moe}`.
+
 ## Pitfalls already hit
 
 - **Comparing against the wrong native baseline.** `monokernel_reports/flash_next_tp8/native_graph_no_spec_20261109_151454/native_graph_detailed`

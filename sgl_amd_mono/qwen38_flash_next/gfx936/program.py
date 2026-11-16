@@ -19,13 +19,13 @@ class SyncArguments(ctypes.Structure):
 
 class MixArguments(ctypes.Structure):
     _fields_ = [(name, ctypes.c_void_p) for name in (
-        "input", "norm_weight", "down_weight", "up_weight", "normalized", "lowrank", "gates", "output", "synchronization", "executions",
+        "input", "norm_weight", "down_weight", "up_weight", "normalized", "lowrank", "gates", "partials", "output", "synchronization", "executions",
     )] + [("rows", ctypes.c_int64), ("timeout_ticks", ctypes.c_int64)]
 
 
 class PostArguments(ctypes.Structure):
     _fields_ = [(name, ctypes.c_void_p) for name in (
-        "attention", "residual", "normalized_residual", "attention_inject", "norm_weight", "mix_down", "mix_up", "mlp_inject", "router_weight", "shared_gate_weight", "expert_gate_up", "expert_down", "shared_gate_up", "shared_down", "reduced_attention", "post_attention", "normalized", "lowrank", "gates", "mixed", "router_logits", "top_ids", "top_weights", "inject_gates", "projected", "activated", "expert_output", "local_moe", "reduced_moe", "output", "executions",
+        "attention", "residual", "normalized_residual", "attention_inject", "norm_weight", "mix_down", "mix_up", "mlp_inject", "router_weight", "shared_gate_weight", "expert_gate_up", "expert_down", "shared_gate_up", "shared_down", "reduced_attention", "post_attention", "normalized", "lowrank", "gates", "partials", "mixed", "router_logits", "top_ids", "top_weights", "inject_gates", "projected", "activated", "expert_output", "local_moe", "reduced_moe", "output", "executions",
     )] + [("sync", SyncArguments), ("rows", ctypes.c_int64)]
 
 
@@ -196,6 +196,7 @@ class HCMix:
         self.normalized = torch.empty((2, 10240), dtype=torch.bfloat16, device=self.device)
         self.lowrank = torch.empty((2, 320), dtype=torch.bfloat16, device=self.device)
         self.gates = torch.empty((2, 10240), dtype=torch.float32, device=self.device)
+        self.partials = torch.empty((2, 40, 320), dtype=torch.float32, device=self.device)  # mix.down split-K chunks
         self.state = torch.zeros(4, dtype=torch.int32, device=self.device)
         self.executions = torch.zeros(1, dtype=torch.int32, device=self.device)
 
@@ -205,7 +206,7 @@ class HCMix:
             raise FlashContractError("Flash-Next HC mix supports one or two decode rows")
         require_tensor(hidden, (rows, 10240), device=self.device)
         output = torch.empty((rows, 2560), dtype=torch.bfloat16, device=self.device)
-        tensors = (hidden, *self.weights, self.normalized, self.lowrank, self.gates, output, self.state, self.executions)
+        tensors = (hidden, *self.weights, self.normalized, self.lowrank, self.gates, self.partials, output, self.state, self.executions)
         arguments = MixArguments(*(tensor.data_ptr() for tensor in tensors), rows, self.program.timeout_ticks)
         with torch.cuda.device(self.device):
             self.program.check(self.program.library.flash_mix(ctypes.byref(arguments), torch.cuda.current_stream(self.device).cuda_stream))
@@ -244,6 +245,7 @@ class PostAttention:
             ("normalized", (2, 10240), torch.bfloat16),
             ("lowrank", (2, 320), torch.bfloat16),
             ("gates", (2, 10240), torch.float32),
+            ("partials", (2, 40, 320), torch.float32),
             ("mixed", (2, 2560), torch.bfloat16),
             ("router_logits", (2, 512), torch.bfloat16),
             ("top_ids", (2, 10), torch.int32),

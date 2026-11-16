@@ -89,7 +89,7 @@ class GDNAttention:
         require_tensor(ssm_state, (conv_state.shape[0], 6, 128, 128), torch.float32, self.device)
         mixed = self.mixed[:rows]
         output = torch.empty_like(mixed)
-        mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, mixed, self.mixer.state, self.mixer.executions)
+        mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, self.mixer.partials, mixed, self.mixer.state, self.mixer.executions)
         mix = MixArguments(*(tensor.data_ptr() for tensor in mix_tensors), rows, self.mixer.program.timeout_ticks)
         tensors = (*self.weights, conv_state, ssm_state, indices, self.projected, self.projected_ba, self.convolved, self.recurrent, self.core, output, self.executions)
         arguments = GDNArguments(mix, *(tensor.data_ptr() for tensor in tensors), *conv_state.stride(), ssm_state.stride(0), indices.element_size(), conv_state.shape[0])

@@ -42,6 +42,7 @@ struct MixArguments {
     BFloat16* normalized;
     BFloat16* lowrank;
     float* gates;
+    float* partials;
     BFloat16* output;
     unsigned int* synchronization;
     int* executions;
@@ -69,6 +70,7 @@ struct PostArguments {
     BFloat16* normalized;
     BFloat16* lowrank;
     float* gates;
+    float* partials;
     BFloat16* mixed;
     BFloat16* router_logits;
     int* top_ids;
@@ -238,12 +240,64 @@ __device__ __forceinline__ void normalize(const BFloat16* input, const BFloat16*
     }
 }
 
+// HC down projection (10240 -> 320) as split-K tasks. A plain gemv gives only rows * 20 tiles, i.e.
+// 20 of 320 waves (blocks 0-4) each walking all 640 K steps while 75 blocks wait in the barrier
+// (layer 8 gdn mix.down ~276 us, 2026-11-16). Each task here is one 16-output tile x one 256-column
+// chunk (the same chunks matvec16 split_k=256 sums), so 800 tasks at b1 cover every wave.
+constexpr int DownChunk = 256;
+constexpr int DownChunks = Hyper / DownChunk;
+constexpr int DownTiles = Lowrank / 16;
+
+__device__ __forceinline__ void mix_down_partials(const BFloat16* input, const BFloat16* weight, float* partials, int rows) {
+    int wave = blockIdx.x * 4 + threadIdx.x / 64;
+    int lane = threadIdx.x & 63;
+    int column = (lane / 16) * 4;
+    for (int task = wave; task < rows * DownChunks * DownTiles; task += Blocks * 4) {
+        int row = task / (DownChunks * DownTiles);
+        int chunk = task / DownTiles % DownChunks;
+        int tile = task % DownTiles;
+        const BFloat16* source = input + row * Hyper + chunk * DownChunk + column;
+        const BFloat16* rows_weight = weight + int64_t(tile * 16 + lane % 16) * Hyper + chunk * DownChunk + column;
+        Short4 left[DownChunk / 16];
+        Short4 right[DownChunk / 16];
+#pragma unroll
+        for (int step = 0; step < DownChunk / 16; ++step) {
+            left[step] = *reinterpret_cast<const Short4*>(rows_weight + step * 16);
+            right[step] = lane % 16 == 0 ? *reinterpret_cast<const Short4*>(source + step * 16) : Short4{0, 0, 0, 0};
+        }
+        Float4 accumulator = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int step = 0; step < DownChunk / 16; ++step) accumulator = __builtin_hcu_mmac_f32_16x16x16_bf16(left[step], right[step], accumulator);
+        if (lane < 16) partials[(row * DownChunks + chunk) * Lowrank + tile * 16 + lane] = accumulator[0];
+    }
+}
+
+// Every block sums the chunk partials in chunk order (bit-identical to matvec16 split_k=256),
+// applies the activation and keeps the BF16 low-rank row in LDS for mix.up. Block 0 also writes
+// args.lowrank for diagnostics.
+__device__ __forceinline__ void mix_down_reduce(const float* partials, BFloat16* shared, BFloat16* lowrank, int rows) {
+    for (int index = threadIdx.x; index < rows * Lowrank; index += Threads) {
+        int row = index / Lowrank;
+        const float* source = partials + row * DownChunks * Lowrank + index % Lowrank;
+        float value = 0.0f;
+#pragma unroll
+        for (int chunk = 0; chunk < DownChunks; ++chunk) value += source[chunk * Lowrank];
+        value = value * 0.25f * sigmoid(value * 0.25f);
+        shared[index] = BFloat16(value);
+        if (blockIdx.x == 0) lowrank[index] = shared[index];
+    }
+    __syncthreads();
+}
+
 __device__ __forceinline__ bool run_mix(MixArguments args, unsigned int stage) {
+    __shared__ __align__(16) unsigned short lowrank_bits[MaxRows * Lowrank];
+    BFloat16* lowrank_shared = reinterpret_cast<BFloat16*>(lowrank_bits);
     normalize(args.input, args.norm_weight, args.normalized, args.rows);
     if (!grid_sync(args.synchronization, args.timeout_ticks, stage)) return false;
-    gemv(args.normalized, args.down_weight, args.lowrank, nullptr, args.rows, Hyper, Lowrank, 1);
+    mix_down_partials(args.normalized, args.down_weight, args.partials, args.rows);
     if (!grid_sync(args.synchronization, args.timeout_ticks, stage + 1)) return false;
-    gemv(args.lowrank, args.up_weight, nullptr, args.gates, args.rows, Lowrank, Hyper, 0);
+    mix_down_reduce(args.partials, lowrank_shared, args.lowrank, args.rows);
+    gemv(lowrank_shared, args.up_weight, nullptr, args.gates, args.rows, Lowrank, Hyper, 0);
     if (!grid_sync(args.synchronization, args.timeout_ticks, stage + 2)) return false;
     for (int index = blockIdx.x * Threads + threadIdx.x; index < args.rows * Hidden; index += Blocks * Threads) {
         int row = index / Hidden;
@@ -370,7 +424,7 @@ __global__ __launch_bounds__(Threads, 1) void post_attention(PostArguments args)
     stage_mark(701);
     if (!all_reduce(args.attention, args.reduced_attention, args.rows * Hidden, args.sync, 10)) return;
     if (!inject(args.reduced_attention, args.residual, args.normalized_residual, args.attention_inject, args.inject_gates, args.post_attention, args.rows, args.sync, 20)) return;
-    MixArguments mix{args.post_attention, args.norm_weight, args.mix_down, args.mix_up, args.normalized, args.lowrank, args.gates, args.mixed, args.sync.state, args.executions, args.rows, args.sync.timeout_ticks};
+    MixArguments mix{args.post_attention, args.norm_weight, args.mix_down, args.mix_up, args.normalized, args.lowrank, args.gates, args.partials, args.mixed, args.sync.state, args.executions, args.rows, args.sync.timeout_ticks};
     if (!run_mix(mix, 30)) return;
     gemv(args.mixed, args.router_weight, args.router_logits, nullptr, args.rows, Hidden, Experts, 0);
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 40)) return;

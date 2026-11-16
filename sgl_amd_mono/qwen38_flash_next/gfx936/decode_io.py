@@ -105,7 +105,7 @@ class DecodeIO:
             raise FlashContractError("Decode tail requires one or two rows")
         mixed = torch.empty((rows, 2560), dtype=torch.bfloat16, device=self.device)
         logits = torch.empty((rows, 248320), dtype=torch.bfloat16, device=self.device)
-        mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, mixed, self.mixer.state, self.mixer.executions)
+        mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, self.mixer.partials, mixed, self.mixer.state, self.mixer.executions)
         mix = MixArguments(*(tensor.data_ptr() for tensor in mix_tensors), rows, self.mixer.program.timeout_ticks)
         arguments = TailArguments(mix, self.head.data_ptr(), self.local_logits.data_ptr(), logits.data_ptr(), self.tail_executions.data_ptr(), self.peers.arguments())
         with torch.cuda.device(self.device):
