@@ -143,7 +143,12 @@ python3 tools/merge_flash_next_stage_timing.py --run-dir <run>/runtime   # 8 ran
   compiled library — each `.so` includes `kernel.cpp` and has its own copy of the device symbol.
 - Only block 0 / thread 0 marks, so the timestamp is "block 0 reached this barrier"; a segment is the
   delta between consecutive marks. Ticks convert with `clock_khz` from `flash_info`.
-- Ranks do not share a clock: compare ranks by duration, never by absolute timestamp.
+- Ranks do not share a clock in the raw `stage-timing-*` / `cu-timing-*` files. `tools/merge_flash_next_stage_timing.py`
+  aligns them (default `--align fit`): it matches the releases of the cross-rank `peer wait` barriers (stages 14, 54,
+  514, 614, 634; ~99 per decode step) and fits `t_rank0 = a·t_rank + b` per rank, applied to stage and per-CU rows
+  alike; report in `alignment` of the summary. 2026-11-14 on `profiles/20261113_180938_…cu_512-64_b1`: offsets
+  −142…+1035 us, drift ≤ 2.4 ppm, residual median ~0.3 us, max 1.7 us — cross-rank differences below ~2 us are noise.
+  `--align none` gives the old unaligned layout (then compare durations only). Tests: `test/unit/test_flash_next_stage_alignment.py`.
 - Graph replay works unchanged (the device pointer is a global, not a kernel parameter). Set
   `SGLANG_AMD_FLASH_STAGE_TIMING_STEP` to a positive decode-step number to export exactly that step;
   0 disables automatic export (the default). Eager and graph replay use the same step counter.
@@ -176,8 +181,24 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --outp
 - Buffer: `[0]` records per block, `[1]` dropped flag, then per block `[cursor, (stage, ticks, hw_id)...]`.
   `SGLANG_AMD_FLASH_CU_TIMING_RECORDS` (default 8192, ~15.7 MiB per rank) holds about two decode
   steps — one step is ~3150 marks per block — so capture one step at a time and check `dropped`.
+  `profile_flash_next_serving.py --cu-steps N` sizes `_RECORDS` for N steps itself and requires
+  N ≤ output_tokens − 1 (a 64-token request has 63 decode steps; export fires on the last requested step, so
+  N = output_tokens silently exported nothing, 2026-11-14). Each step is ~254k span events / 66 MB JSON per rank.
+  The export runs synchronously in the scheduler: `--cu-steps 32` took ~7 min (2.1 GB per rank), SGLang's 300 s
+  watchdog killed the server and the client only showed `Connection refused` on `/stop_profile` (2026-11-14). The tool
+  now passes `--watchdog-timeout max(300, 60·N)`; when launching by hand with CU timing, pass it yourself.
+  With the watchdog raised, the next 32-step run exported fine, but rank 7 was then SIGKILLed (exit -9) during torch
+  profiler `stop_trace` (host OOM, cgroup `oom_kill` rising, swap full). Streaming the JSON did not help (same crash on
+  rank 6 at 20:45). Real cause: the export runs *inside* the torch-profiler capture and `stage_timing.launches()` indexed
+  the record tensor per element (`int(records[i, 0])`), several aten ops per record × ~8M records, all recorded with
+  shapes; `stop_trace` then OOMs. `launches()`/`cu_timing.export_trace` now `.tolist()` once (one step: 160 profiler
+  ops, 4.6 s). Never iterate a tensor element-wise in code that can run during a capture. Keep N ≤ 4 unless needed.
+  After that the 32-step capture succeeded, but the client's automatic CU merge (17 GB JSON, 164 GB RSS, one joined string
+  gzipped at level 9) ran >40 min with 0 bytes written. `merge()` now streams with gzip level 1, and
+  `merge_flash_next_stage_timing.py --steps 1-4` keeps only those per-CU steps (stage rows are kept in full):
+  4 of 32 steps → 253 MB `.json.gz` in ~13 min, almost all of it spent reading the 8 × 2.1 GB inputs.
 - The CU trace reuses the stage trace's tick base when both are on, so the two sets of rows line up
-  in one timeline. Across ranks compare durations only, never absolute timestamps.
+  in one timeline. The merge aligns ranks onto rank 0's clock (see stage timing above; ~2 us precision).
 - `HW_ID` decoding is gfx9 (`cu` bits 8-11, `sh` bit 12, `se` bits 13-15); wave/SIMD/pipe are
   recorded but deliberately not part of a row's identity.
 - **A block keeps its CU within one launch but is placed elsewhere on the next launch**, so spans

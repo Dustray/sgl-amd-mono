@@ -122,8 +122,9 @@ def export_trace(per_block, path, clock_khz, rank, dropped=False, base=None):
     blocks_per_cu = {}
     migrated = []
     for block, records in enumerate(per_block):
-        if records is None or records.shape[0] == 0:
+        if records is None or len(records) == 0:
             continue
+        records = records.tolist() if hasattr(records, "tolist") else records
         step, layer, kinds, offset = 0, -1, {}, 0
         prev_end, prev_kind = None, None
         for launch in launches(records):
@@ -131,8 +132,8 @@ def export_trace(per_block, path, clock_khz, rank, dropped=False, base=None):
             first_index, offset = offset, offset + len(marks)
             if not marks:
                 continue
-            launch_keys = {cu_key(value) for value in records[first_index:offset, 2].tolist()}
-            key = cu_key(records[first_index, 2])
+            launch_keys = {cu_key(row[2]) for row in records[first_index:offset]}
+            key = cu_key(records[first_index][2])
             if len(launch_keys) > 1:
                 migrated.append({"block": block, "step": step, "kind": launch["kind"],
                                  "cus": sorted(cu_label(item) for item in launch_keys)})
@@ -162,15 +163,26 @@ def export_trace(per_block, path, clock_khz, rank, dropped=False, base=None):
     if base is None and spans:
         base = min(span["start"] for span in spans)
     base = base or 0
-    events = [{"ph": "M", "name": "process_name", "pid": pid, "tid": 0,
-               "args": {"name": f"rank {rank} (per-CU occupancy)"}}]
+    # Stream events to disk: 32 steps is ~8M events per rank, and building the full event list plus
+    # one joined string held tens of GB per rank while all 8 ranks exported at once (host OOM, 2026-11-14).
+    count = 0
+
+    def emit(event):
+        nonlocal count
+        output.write(("," if count else "") + json.dumps(event, separators=(",", ":")))
+        count += 1
+
+    output = path.open("w")
+    output.write('{"displayTimeUnit":"ms","traceEvents":[')
+    emit({"ph": "M", "name": "process_name", "pid": pid, "tid": 0,
+          "args": {"name": f"rank {rank} (per-CU occupancy)"}})
     tids = {}
     for key in sorted(blocks_per_cu):
         tids[key] = len(tids) + 1
         hosted = sorted(blocks_per_cu[key])
         suffix = f"block {hosted[0]}" if len(hosted) == 1 else f"{len(hosted)} blocks"
-        events.append({"ph": "M", "name": "thread_name", "pid": pid, "tid": tids[key],
-                       "args": {"name": f"{cu_label(key)} ({suffix})"}})
+        emit({"ph": "M", "name": "thread_name", "pid": pid, "tid": tids[key],
+              "args": {"name": f"{cu_label(key)} ({suffix})"}})
     for span in spans:
         phase = span["phase"]
         if phase == "gap":
@@ -182,17 +194,17 @@ def export_trace(per_block, path, clock_khz, rank, dropped=False, base=None):
         else:
             name = f"{span['scope']}: {span['name']}"
             category = "cu_compute"
-        events.append({"ph": "X", "cat": category, "name": name, "pid": pid, "tid": tids[span["key"]],
+        emit({"ph": "X", "cat": category, "name": name, "pid": pid, "tid": tids[span["key"]],
                        "ts": (span["start"] - base) / ticks_per_us,
                        "dur": (span["end"] - span["start"]) / ticks_per_us,
                        "args": {"tp_rank": rank, "block": span["block"], "cu": cu_label(span["key"]),
                                 "se": span["key"][0], "shader_array": span["key"][1], "compute_unit": span["key"][2],
                                 "step": span["step"], "layer": span["layer"], "kernel": span["kind"],
                                 "stage": span["stage"], "phase": span["phase"]}})
-    text = '{"displayTimeUnit":"ms","traceEvents":[' + ",".join(json.dumps(event, separators=(",", ":")) for event in events) + "]}"
-    path.write_text(text)
-    return {"trace": str(path), "rank": rank, "events": len(events), "dropped": dropped,
-            "base_ticks": base, "compute_units": len(tids), "blocks": sum(1 for records in per_block if records is not None and records.shape[0]),
+    output.write("]}")
+    output.close()
+    return {"trace": str(path), "rank": rank, "events": count, "dropped": dropped,
+            "base_ticks": base, "compute_units": len(tids), "blocks": sum(1 for records in per_block if records is not None and len(records)),
             "shared_units": sorted(cu_label(key) for key, blocks in blocks_per_cu.items() if len(blocks) > 1),
             "migrated_launches": migrated[:16], "migrated_launch_count": len(migrated),
             "summary": summarize(spans, ticks_per_us)}

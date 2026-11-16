@@ -21,6 +21,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MODEL = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-Flash-Next/snapshots/master"
 
 
+# Per-CU capture sizing, measured 2026-11-13 on 512->64 b1 (one decode step): ~3150 marks per block,
+# 254k span events and 66 MB JSON per rank.
+CU_MARKS_PER_STEP = 3400
+CU_EVENTS_PER_STEP_PER_RANK = 254_000
+
+
 def save(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
@@ -90,20 +96,41 @@ def shadow_state(info):
     return [{"rank": state["tp_rank"], "acceptance_status": state["acceptance_status"], "whole_decoder_monokernel": state["whole_decoder_monokernel"], "completed_decode_steps": state["completed_decode_steps"], "shadow_checks": len(state["shadow_checks"]), "full_model_shadow_checks": len(state["full_model_shadow_checks"]), "executions": state["executions"]} for state in states]
 
 
+def stage_progress(mode, label):
+    """One progress line per long merge step, with elapsed time since the phase started.
+
+    Reading ~2 GB JSON per rank and writing the merged trace can take many minutes, so a
+    progress print distinguishes 'slow' from 'stuck'."""
+    started = [time.perf_counter()]
+
+    def show(message):
+        now = time.perf_counter()
+        print(f"{mode}: [{label}] {message} (+{now - started[0]:.1f}s)", flush=True)
+        started[0] = now
+
+    return show
+
+
 def merge_cu_timing(arguments, mode, directory):
     """Fold the per-rank per-CU captures (runtime/cu-timing-decode-rank-*.json) into one
     gzip Perfetto file next to the main trace, so --cu-stages needs no manual merge step."""
-    from tools.merge_flash_next_stage_timing import load, load_cu, merge, summarize, summarize_cu
+    from tools.merge_flash_next_stage_timing import load, load_cu, merge, print_alignment, summarize, summarize_cu
 
     runtime = directory / "runtime"
-    traces = load(runtime)
-    cu_traces = load_cu(runtime)
-    if not cu_traces:
-        raise FileNotFoundError(f"No cu-timing-*-rank-*.json in {runtime}; the server may not have reached decode step {arguments.warmup * 3 + 1}")
+    first = arguments.warmup * 3 + 1
+    last = first + arguments.cu_steps - 1
+    if not any(runtime.glob("stage-timing-*-rank-*.json")) or not any(runtime.glob("cu-timing-*-rank-*.json")):
+        raise FileNotFoundError(f"No stage/cu-timing-*-rank-*.json in {runtime}: export runs once the server completes decode "
+                                f"step {last} (steps {first}..{last}); check completed_decode_steps in server_info_after.json "
+                                "and AMD_FLASH_*_TIMING lines in server.log")
+    progress = stage_progress(mode, "cu-timing merge")
+    traces = load(runtime, progress=progress)
+    cu_traces = load_cu(runtime, progress=progress)
     output = directory / ("inference.mono_only.cu_stages.json.gz" if arguments.mono_only else "inference.perfetto.cu_stages.json.gz")
-    merge(traces, output, cu_traces)
+    alignment = merge(traces, output, cu_traces, progress=progress)
+    print_alignment(alignment)
     summary_path = directory / "cu_stages-summary.json"
-    summary_path.write_text(json.dumps({"ranks": [rank for rank, _, _ in traces], "segments": summarize(traces),
+    summary_path.write_text(json.dumps({"ranks": [rank for rank, _, _ in traces], "alignment": alignment, "segments": summarize(traces),
                                         "compute_units": summarize_cu(cu_traces)}, indent=2) + "\n")
     rows = summarize_cu(cu_traces)
     fractions = sorted({row["compute_fraction"] for row in rows})
@@ -169,7 +196,9 @@ def capture(arguments, mode, directory, url, inputs):
     save(host_directory / "client.json", client_events)
     stage_directory = directory / "runtime" if arguments.kernel_stages and mode == "monokernel" else None
     trace_name = "inference.mono_only.json.gz" if arguments.mono_only else "inference.perfetto.json.gz"
-    summary = merge_profiles(trace_paths, directory / trace_name, host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1), device_stage_directory=stage_directory, mono_only=arguments.mono_only)
+    print(f"{mode}: merging {len(trace_paths)} rank traces into {trace_name}", flush=True)
+    merge_progress = stage_progress(mode, "trace merge")
+    summary = merge_profiles(trace_paths, directory / trace_name, host_directory, client_events, expected_ranks=8, expected_decode_steps=arguments.output_tokens - 1 if arguments.batch_size == 1 else None, include_python_functions=arguments.keep_python_functions, expected_decode_token_rows=arguments.batch_size * (arguments.output_tokens - 1), device_stage_directory=stage_directory, mono_only=arguments.mono_only, progress=merge_progress)
     cu_trace = merge_cu_timing(arguments, mode, directory) if arguments.cu_stages and mode == "monokernel" else None
     if cu_trace:
         summary["cu_stage_trace"] = str(cu_trace)
@@ -177,6 +206,8 @@ def capture(arguments, mode, directory, url, inputs):
         expected = next(state["phases"]["DECODE"]["forwards"] for state in summary["ranks"] if state["rank"] == after_state["rank"])
         if after_state["completed_decode_steps"] - before_state["completed_decode_steps"] != expected:
             raise RuntimeError("Fused route counters do not match captured decode forwards")
+    progress = stage_progress(mode, "report")
+    progress("writing summary.json")
     summary["shadow_state_before"] = before_shadow
     summary["shadow_state_after"] = after_shadow
     summary["profile_is_accuracy_acceptance"] = False
@@ -271,11 +302,13 @@ def run_service(arguments, mode, directory, inputs):
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEP"] = str(arguments.warmup * 3 + 1)
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEPS"] = str(arguments.output_tokens - 1)
     if arguments.cu_stages and mode == "monokernel":
-        # Every block records, so one step fills ~3.2k of the 8k per-block slots: capture one step.
+        # Every block records ~3.2k marks per decode step; size the per-block buffer for the
+        # requested steps (default 8192 holds only ~2) so long captures do not set `dropped`.
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING"] = "1"
         overrides["SGLANG_AMD_FLASH_CU_TIMING"] = "1"
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEP"] = str(arguments.warmup * 3 + 1)
         overrides["SGLANG_AMD_FLASH_STAGE_TIMING_STEPS"] = str(arguments.cu_steps)
+        overrides["SGLANG_AMD_FLASH_CU_TIMING_RECORDS"] = str(max(1 << 13, arguments.cu_steps * CU_MARKS_PER_STEP + 1024))
     if arguments.decode_graph:
         overrides["HIP_GRAPH_ACCUMULATE_DISPATCH"] = "0"
     environment.update(overrides)
@@ -289,8 +322,12 @@ def run_service(arguments, mode, directory, inputs):
         command = ["hipprof", "--hip-trace", "--follow-fork", "--trace-off", "--session", session,
                    "--output-type", "2", "-o", str(directory / "hipprof" / f"{mode}.pftrace"),
                    "-d", str(directory / "hipprof"), *command]
+    if arguments.cu_stages and mode == "monokernel":
+        # The per-CU export runs inside the scheduler's decode step and writes ~66 MB JSON per step
+        # per rank (32 steps: ~2.1 GB, ~7 min); the default 300 s watchdog kills the server mid-write.
+        command += ["--watchdog-timeout", str(max(300, 60 * arguments.cu_steps))]
     if arguments.decode_graph:
-        batch_sizes = [str(size) for size in range(1, arguments.batch_size + 1)]
+        batch_sizes =[str(size) for size in range(1, arguments.batch_size + 1)]
         command += ["--cuda-graph-backend-decode", "full", "--cuda-graph-max-bs-decode", str(arguments.batch_size), "--cuda-graph-bs-decode", *batch_sizes, "--disable-cuda-graph-padding"]
     with (directory / "server.log").open("w") as log:
         server = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -363,9 +400,9 @@ def main():
     parser.add_argument("--hipprof", action="store_true", help="Trace with hipprof (HIP API/kernel/copy) instead of the torch profiler; writes a .pftrace per mode")
     parser.add_argument("--keep-python-functions", action="store_true")
     parser.add_argument("--mono-only", action="store_true", help="export only Monokernel-related events (fused kernels, device stages, inference/ step markers) to a much smaller merged trace; validation still uses the full per-rank traces")
-    parser.add_argument("--kernel-stages", action="store_true", help="embed every measured Monokernel decode step's device-stage spans in the torch-profiler Perfetto trace")
+    parser.add_argument("--kernel-stages", action ="store_true", help="embed every measured Monokernel decode step's device-stage spans in the torch-profiler Perfetto trace")
     parser.add_argument("--cu-stages", action="store_true", help="also record what every compute unit ran (one Perfetto row per CU) into <dir>/runtime/cu-timing-decode-rank-*.json; merge with tools/merge_flash_next_stage_timing.py")
-    parser.add_argument("--cu-steps", type=int, default=1, help="decode steps to record with --cu-stages (per-block buffers hold about two steps)")
+    parser.add_argument("--cu-steps", type=int, default=1, help="decode steps to record with --cu-stages, 1..output_tokens-1 (the per-CU buffer is sized automatically; each step adds ~66 MB JSON per rank)")
     parser.add_argument("--port", type=int, default=30160)
     parser.add_argument("--url", help="Attach to an existing server with profiling ranges already enabled")
     parser.add_argument("--host-event-dir", help="Frontend event directory configured on an attached server")
@@ -388,6 +425,15 @@ def main():
         parser.error("--host-event-dir is only used with --url")
     if arguments.input_tokens < 1 or arguments.output_tokens < 2 or arguments.warmup < 1 or arguments.input_tokens + arguments.output_tokens > 4096:
         parser.error("Require input>=1, output>=2, warmup>=1, input+output<=4096")
+    if arguments.cu_stages and not 1 <= arguments.cu_steps <= arguments.output_tokens - 1:
+        # The measured request has output_tokens - 1 decode steps (the first token comes from prefill);
+        # export fires on the last requested step, so asking for more never exports anything.
+        parser.error(f"--cu-steps must be in 1..{arguments.output_tokens - 1} (decode steps of one {arguments.output_tokens}-token request)")
+    if arguments.cu_stages and arguments.cu_steps > 4:
+        events = arguments.cu_steps * CU_EVENTS_PER_STEP_PER_RANK
+        print(f"warning: --cu-steps {arguments.cu_steps} = ~{events / 1e6:.0f}M span events per rank "
+              f"(~{events * 260 / 2**30:.1f} GiB JSON per rank, ~{events * 8 * 260 / 2**30:.0f} GiB merged uncompressed); "
+              "the Perfetto UI cannot open much beyond ~1-2 GiB, and per-rank export/merge holds it all in host RAM", flush=True)
     if arguments.output_dir is None:
         # Auto-name the run directory: stamp + mode + every flag that changes what is captured,
         # so re-running with different arguments never collides with an older directory.

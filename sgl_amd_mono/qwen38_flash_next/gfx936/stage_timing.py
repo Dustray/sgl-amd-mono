@@ -133,9 +133,13 @@ def launches(records):
     A launch begins at its kernel's start stage; barriers inside a kernel never repeat that
     stage, so the split is unambiguous.
     """
+    # One bulk conversion: per-element tensor indexing is several aten ops per record, which the
+    # torch profiler records when export runs inside a capture (8M records for 32 CU steps ->
+    # host OOM in stop_trace, 2026-11-14).
+    rows = records.tolist() if hasattr(records, "tolist") else records
     current = None
-    for index in range(records.shape[0]):
-        stage, ticks = int(records[index, 0]), int(records[index, 1])
+    for row in rows:
+        stage, ticks = int(row[0]), int(row[1])
         kind = kind_of(stage)
         if current is None or kind != current["kind"] or stage == START_STAGE.get(kind):
             if current is not None:

@@ -193,8 +193,11 @@ def _embed_device_stage_events(events, stage_trace, rank):
                       "max_launch_start_error_us": max_launch_start_error}
 
 
-def merge_profiles(trace_paths, output, host_directory=None, client_events=(), expected_ranks=8, expected_decode_steps=None, include_python_functions=False, expected_decode_token_rows=None, device_stage_directory=None, mono_only=False):
+def merge_profiles(trace_paths, output, host_directory=None, client_events=(), expected_ranks=8, expected_decode_steps=None, include_python_functions=False, expected_decode_token_rows=None, device_stage_directory=None, mono_only=False, progress=None):
     """Merge per-rank torch-profiler traces into one Perfetto-compatible trace.
+
+    ``progress`` (optional) is called with a short human-readable message at every long stage
+    (per-rank read, host events, gzip write, operators.csv) so callers can show progress.
 
     With ``mono_only=True`` the input traces are still fully validated (GPU kernels present,
     DECODE/prefill coverage, expected steps/rows, rank set), but the merged output and
@@ -205,6 +208,12 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".partial")
     identities = {}
+
+    def report(message):
+        if progress is not None:
+            progress(message)
+
+
     flow_ids = {}
     rank_summaries = []
     operators = []
@@ -233,6 +242,7 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
         destination.write(b'{"displayTimeUnit":"ms","traceEvents":[')
         buffer = []
 
+
         def flush():
             nonlocal first_event
             if not buffer:
@@ -258,6 +268,7 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
             if rank in seen_ranks:
                 raise ValueError(f"Duplicate TP rank: {rank}")
             seen_ranks.add(rank)
+            report(f"merge: reading rank {rank} trace ({path.stat().st_size / 2**30:.2f} GiB)")
             trace = read_trace(path)
             base = trace.get("baseTimeNanoseconds")
             if not isinstance(base, int):
@@ -304,6 +315,7 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
                 stage_path = Path(device_stage_directory) / f"stage-timing-decode-rank-{rank}.json"
                 if not stage_path.is_file():
                     raise ValueError(f"Missing device stage trace for TP rank {rank}: {stage_path}")
+                report(f"merge: embedding device stages for rank {rank}")
                 stage_trace = read_trace(stage_path)
                 embedded, stage_summary = _embed_device_stage_events(events, stage_trace, rank)
                 stage_pid = identity("pid", rank, stage_summary["pid"])
@@ -330,7 +342,9 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
             raise ValueError(f"Expected TP ranks 0..{expected_ranks - 1}, found {sorted(seen_ranks)}")
         # mono_only drops host/frontend/client events from the exported trace, but the files are
         # still read and host_ranges still counted so capture-completeness checks keep working.
+        report("merge: reading host/frontend event files")
         host_events = [] if mono_only else list(client_events)
+
         if host_directory is not None:
             for path in sorted(Path(host_directory).glob("host-*.jsonl")):
                 with path.open() as source:
@@ -348,8 +362,10 @@ def merge_profiles(trace_paths, output, host_directory=None, client_events=(), e
                 continue  # counted for the summary / capture checks, but not exported
             emit(event)
             emit(event)
+        report(f"merge: finishing gzip output ({total_events} events)")
         flush()
         destination.write(('],"baseTimeNanoseconds":' + str(common_base) + "}").encode())
+    report("merge: writing operators.csv")
     temporary.replace(output)
     operators.sort(key=lambda row: (row["rank"], row["category"], -row["total_us"]))
     csv_path = output.with_name("operators.csv")
