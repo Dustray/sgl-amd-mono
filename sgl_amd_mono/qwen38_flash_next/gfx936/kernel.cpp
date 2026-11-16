@@ -271,17 +271,27 @@ __device__ __forceinline__ void gemv(const BFloat16* input, const BFloat16* weig
 __device__ __forceinline__ void normalize(const BFloat16* input, const BFloat16* weight, BFloat16* output, int rows) {
     int wave = blockIdx.x * 4 + threadIdx.x / 64;
     int lane = threadIdx.x & 63;
+    // Only rows * 4 waves work here (block 0 at b1), so the time is load latency: all 40 values of a
+    // lane are loaded up front (independent loads) instead of one dependent load per iteration, and
+    // reused for the output pass. Sum order per lane and the output expression are unchanged.
+    // Tasks are spread over blocks first (task t on block t % Blocks) so the 4-8 waves do not share
+    // one CU's memory path; which wave runs a task does not change its result.
+    constexpr int NormSteps = Hidden / 64;
+    wave = (threadIdx.x / 64) * Blocks + blockIdx.x;
     for (int task = wave; task < rows * Branches; task += Blocks * 4) {
         int offset = task * Hidden;
+        const BFloat16* scale = weight + (task % Branches) * Hidden;
+        float values[NormSteps];
+#pragma unroll
+        for (int step = 0; step < NormSteps; ++step) values[step] = float(input[offset + lane + step * 64]);
         float sum = 0.0f;
-        for (int column = lane; column < Hidden; column += 64) {
-            float value = float(input[offset + column]);
-            sum += value * value;
-        }
+#pragma unroll
+        for (int step = 0; step < NormSteps; ++step) sum += values[step] * values[step];
         float inverse = rsqrtf(wave_sum(sum) / Hidden + 1.0e-6f);
-        for (int column = lane; column < Hidden; column += 64) {
-            float value = float(input[offset + column]);
-            output[offset + column] = BFloat16(value * inverse * (1.0f + float(weight[(task % Branches) * Hidden + column])));
+#pragma unroll
+        for (int step = 0; step < NormSteps; ++step) {
+            int column = lane + step * 64;
+            output[offset + column] = BFloat16(values[step] * inverse * (1.0f + float(scale[column])));
         }
     }
 }
@@ -292,17 +302,20 @@ __device__ __forceinline__ void normalize(const BFloat16* input, const BFloat16*
 // (double buffer). One accumulator is still chained over all of K in the same step order and with
 // the same operands as matvec16(split_k=0), so the result is bit-identical. Lanes < 16 return the
 // tile's outputs; rows >= valid read as zero weights, as in matvec16.
+// Width is the K of the gemv (a multiple of PipeChunk: Hidden = 2560 or the 768-wide attention core).
 constexpr int PipeChunk = 128;
 constexpr int PipeSteps = PipeChunk / 16;
-constexpr int PipeChunks = Hidden / PipeChunk;
 
+template <int Width = Hidden>
 __device__ __forceinline__ float matvec16_pipelined(const BFloat16* input, const BFloat16* weight, int valid = 16) {
+    static_assert(Width % PipeChunk == 0, "pipelined gemv width must be a multiple of PipeChunk");
+    constexpr int PipeChunks = Width / PipeChunk;
     int lane = threadIdx.x & 63;
     int column = (lane / 16) * 4;
     bool has_row = lane % 16 < valid;
     bool has_input = lane % 16 == 0;
     const BFloat16* source = input + column;
-    const BFloat16* rows_weight = weight + int64_t(lane % 16) * Hidden + column;
+    const BFloat16* rows_weight = weight + int64_t(lane % 16) * Width + column;
     Short4 left[2][PipeSteps];
     Short4 right[2][PipeSteps];
 #pragma unroll
@@ -341,6 +354,22 @@ __device__ __forceinline__ void router_gemv(const BFloat16* input, const BFloat1
         int base = task % RouterTiles * 16;
         float value = matvec16_pipelined(input + row * Hidden, weight + int64_t(base) * Hidden);
         if (lane < 16) output[row * Experts + base + lane] = BFloat16(value);
+    }
+}
+
+// Drop-in for gemv(input, weight, output, nullptr, rows, Width, outputs, 0) with pipelined loads;
+// same tile-to-wave mapping and bit-identical BF16 outputs.
+template <int Width>
+__device__ __forceinline__ void pipelined_gemv(const BFloat16* input, const BFloat16* weight, BFloat16* output, int rows, int outputs) {
+    int wave = blockIdx.x * 4 + threadIdx.x / 64;
+    int lane = threadIdx.x & 63;
+    int tiles = (outputs + 15) / 16;
+    for (int task = wave; task < rows * tiles; task += Blocks * 4) {
+        int row = task / tiles;
+        int base = task % tiles * 16;
+        int valid = outputs - base < 16 ? outputs - base : 16;
+        float value = matvec16_pipelined<Width>(input + row * Width, weight + int64_t(base) * Width, valid);
+        if (lane < valid) output[row * outputs + base + lane] = BFloat16(value);
     }
 }
 
@@ -534,7 +563,13 @@ __global__ __launch_bounds__(Threads, 1) void post_attention(PostArguments args)
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 40)) return;
     // Top-10 routing: wave 0 of block 1 + row (the shared-gate gemv below runs on block 0's waves).
     if (blockIdx.x >= 1 && blockIdx.x <= args.rows && threadIdx.x < 64) router_topk(args.router_logits, args.top_ids, args.top_weights, blockIdx.x - 1);
-    gemv(args.mixed, args.shared_gate_weight, nullptr, args.inject_gates + args.rows * Branches, args.rows, Hidden, 1, 0);
+    // Shared-expert gate (2560 -> 1 per row): one tile per row on wave `row` of block 0, with the
+    // pipelined loads (plain matvec16 waited on 160 dependent loads, ~46 us, 2026-11-16).
+    if (blockIdx.x == 0 && threadIdx.x / 64 < args.rows) {
+        int row = threadIdx.x / 64;
+        float value = matvec16_pipelined(args.mixed + row * Hidden, args.shared_gate_weight, 1);
+        if ((threadIdx.x & 63) == 0) args.inject_gates[args.rows * Branches + row] = value;
+    }
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 41)) return;
     int wave = blockIdx.x * 4 + threadIdx.x / 64;
     int lane = threadIdx.x & 63;
@@ -545,7 +580,7 @@ __global__ __launch_bounds__(Threads, 1) void post_attention(PostArguments args)
         int slot = task / UpTiles % Slots;
         int base = task % UpTiles * 16;
         const BFloat16* weight = slot == Topk ? args.shared_gate_up : args.expert_gate_up + int64_t(args.top_ids[row * Topk + slot]) * (2 * Intermediate) * Hidden;
-        float value = matvec16(args.mixed + row * Hidden, weight + int64_t(base) * Hidden, Hidden);
+        float value = matvec16_pipelined(args.mixed + row * Hidden, weight + int64_t(base) * Hidden);
         if (lane < 16) args.projected[(row * Slots + slot) * Intermediate * 2 + base + lane] = BFloat16(value);
     }
     if (!grid_sync(args.sync.state, args.sync.timeout_ticks, 42)) return;

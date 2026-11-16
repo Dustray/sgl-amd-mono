@@ -367,6 +367,18 @@ trace 里的阶段名按“结束于哪个 barrier”命名，和实际内容有
 | 2 | MoE top-10 选择（post kernel，stage 41） | block 0 一个线程串行：10 轮 × 512 个专家，每轮从显存重读 logits，还要和已选专家逐个比较；rank 0 上 block 0 中位数约 **493 us/层**，48 层约 24 ms/token | `router_topk`：每行用一个 wave（block 1+row 的 wave 0，和 block 0 上的 shared gate gemv 并行）。每个 lane 在寄存器里放 8 个 logits，最大值和每轮 argmax 都用 wave 内 butterfly 归约，已选专家用位掩码标记 | 选择规则不变（严格 `>`、相同值取最小 id、-inf/NaN 不会选中）；概率按选择顺序串行求和再相除，按设计应逐位一致 | 已改代码，逐位一致**尚未验证** |
 | 3 | router gemv（2560→512，post kernel，stage 40） | 512/16 = 32 个 tile，只有 block 0–7 在算；`matvec16` 每 16 列发一次 load 就等它返回，一个 tile 要等 160 次；约 **64 us/层** | `router_gemv`：每个 wave 一次预取 128 列，算当前块的同时加载下一块（双缓冲），等待次数降到约 20 次 | 一个累加器串过整个 K，MMAC 顺序与 `matvec16(split_k=0)` 相同，按设计应逐位一致 | 已改代码，逐位一致**尚未验证**。改完后仍只有 32 个 wave 在算，所以这几个 CU 仍会比其余的长 |
 | 4 | GDN `qkvz+ba gemv`（2560→2048 + 2560→12，gdn kernel，stage 310） | 两次普通 gemv：qkvz 128 个 tile（b1）用 wave 0–127，ba 1 个 tile 又从 wave 0 开始，所以 wave 0 串行做两个 tile；每个 tile 同样是 160 次串行 load | 双缓冲 gemv 抽成公共的 `matvec16_pipelined`（router gemv 也改用它）；qkvz 和 ba 放进同一个任务空间，ba 排在 qkvz 之后（b1 在 wave 128，b2 在 wave 256/257），不再和 qkvz tile 0 挤在 wave 0 | 与 #3 相同，按设计应逐位一致 | 已编译运行，stage 310 降到改前的约 30%；TPOT 43.09 → 40.37 ms。逐位一致**尚未验证**。b1 仍只有 129/320 个 wave 有活，见下文“待做” |
+| 5 | shared gate gemv（2560→1，post kernel，stage 41，trace 名 `shared gate`） | #2 之后 stage 41 里 block 0（shared gate）约 **46 us/层**，block 1（top-10 选择）约 28 us，其余 block 1.8 us（`profiles/20261116_173021_…_csteps2`，rank 0，96 次 launch 中位数）。原来是普通 `gemv`，只有 1 个有效输出，同样要串行等 160 次 load | 直接在 block 0 的 wave `row` 上调用 `matvec16_pipelined(..., valid=1)`。block 和 wave 的分配不变，仍和 block 1/2 上的 top-10 并行 | 累加顺序与 `matvec16` 相同，按设计应逐位一致 | 已编译运行（和 #6–#9 一起测，见下文“改动后的端到端性能”），逐位一致**尚未验证**。改完后 stage 41 预计由 top-10 的约 28 us 决定 |
+| 6 | MoE `gate+up gemv`（post kernel，stage 42） | 所有 block 都在算，但每个 tile 用 `matvec16`，160 次串行 load；约 **59.5 us/层** × 48 = 2.86 ms/步 | 改用 `matvec16_pipelined` | 同 #3，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
+| 7 | `normalize`（HC 4 个分支的 RMSNorm，post / gdn / qsa 的 `mix.normalize`，stage 30 / 300 / 401） | b1 只有 4 个任务，全挤在 block 0 的 4 个 wave 上，每个 lane 串行 load 40 次；post 约 **30.6 us/层**，gdn 约 37 us，qsa 约 36.5 us，合计约 3.2 ms/步 | 任务改为先横向铺到不同 block（`wave = wave_in_block * Blocks + blockIdx.x`）；每个 lane 一次 load 完 40 个值放寄存器，平方和与输出两遍都复用 | 每个任务仍由一个 wave 算完，每个 lane 的求和顺序和输出表达式不变，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
+| 8 | QSA `qkv+index gemv`（2560→2048 + 2560→640，qsa kernel，stage 405） | 两次普通 gemv 都从 wave 0 开始，wave 0–39 串行做两个 tile；约 **148 us/层** × 12 = 1.75 ms/步 | 同 #4：两个 gemv 合进一个任务空间（qkv 168 个任务中前 128 个，index 在后），都用 `matvec16_pipelined` | 同 #3，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
+| 9 | GDN / QSA `output gemv`（768→2560，stage 313 / 413） | `matvec16` 串行 load；gdn 约 25 us，qsa 约 29 us | `matvec16_pipelined` 加模板参数 `Width`（K=768 也能用），新增 `pipelined_gemv<Width>`，tile 到 wave 的映射与 `gemv` 相同 | 同 #3，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
+
+#6–#9 的改前数据来自 `profiles/20261116_173021_monokernel_monoonly_cu_512-64_b1_csteps2`（rank 0，2 个 decode step）。
+
+还没做的较大项（同一份 profile）：
+- QSA `softmax+attn`（stage 412）：约 **330 us/层** × 12 = 3.96 ms/步，是现在最大的一段。b1 只有 3 个任务（3 个 head），每个 block 内 256 个线程对每组 64 个 token 串行做 max、求和和 value 累加。可以在保持 `normalizer` / `accumulator` 累加顺序不变的前提下并行化。
+- `attn.reduce` / `moe.reduce`（stage 13 / 53）：各约 25 us/层，时间花在跨 8 卡的 system-scope atomic load 等待上，改计算没用。
+- QSA `top512 select`（stage 410）：约 86 us/层，bitonic 排序，改排序网络会影响 tie-break。
 
 关于第 3 项：要让 80 个 block 都参与 router gemv，只能做跨 wave 的 split-K，但这会改变 router logits 的舍入。路由边界（第 10/11 个专家）打平本来就是已知的精度问题，所以这次没有做 split-K。
 
@@ -386,7 +398,8 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --c
 | 改前 Mono（11-10，主表） | 633 | 94.7 | 6.60 | 10.56 |
 | 11-16 前一次测量（#1、#2） | 604 | 45.03 | 3.44 | 22.21 |
 | 11-16（#1、#2、#3） | 587 | 43.09 | 3.30 | 23.21 |
-| **11-16 最新（#1–#4）** | **597** | **40.37** | **3.14** | **24.77** |
+| 11-16（#1–#4） | 597 | 40.37 | 3.14 | 24.77 |
+| **11-16 最新（#1–#9）** | **584** | **34.48** | **2.76** | **29.00** |
 | 参照：原生 + Graph（11-10，主表） | 660 | 45.5 | 3.53 | 21.96 |
 
 3 轮明细：
@@ -399,11 +412,14 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --c
 | #1–#4 | 1 | 596.2 | 40.34 | 3.138 | 24.79 |
 | | 2 | 594.4 | 40.37 | 3.138 | 24.77 |
 | | 3 | 600.1 | 40.39 | 3.145 | 24.76 |
+| #1–#9 | 1 | 580.6 | 34.48 | 2.753 | 29.01 |
+| | 2 | 573.5 | 34.38 | 2.740 | 29.08 |
+| | 3 | 598.7 | 34.57 | 2.777 | 28.92 |
 
-#1、#2、#3：prefill 581.07 ms，output tok/s 19.38，数据在 `bench_results/20261111_monokernel_eager_b1_512-64-1/`。#1–#4：prefill 590.22 ms，output tok/s 20.38。
+#1、#2、#3：prefill 581.07 ms，output tok/s 19.38，数据在 `bench_results/20261111_monokernel_eager_b1_512-64-1/`。#1–#4：prefill 590.22 ms，output tok/s 20.38。#1–#9：prefill 578.40 ms，output tok/s 23.22。
 
-- Mono 不开 Graph 的 TPOT 从 94.7 ms 降到 40.37 ms（−57%），比原生 + Graph 的 45.5 ms 快约 11%。
-- 精度：#1 已验证逐位一致；#2、#3、#4 的逐位一致还没验证，这些数字只代表性能。
+- Mono 不开 Graph 的 TPOT 从 94.7 ms 降到 34.48 ms（−64%），比原生 + Graph 的 45.5 ms 快约 24%。#5–#9 这一轮从 40.37 ms 降到 34.48 ms（−5.9 ms/token）。
+- 精度：#1 已验证逐位一致；#2–#9 的逐位一致还没验证，这些数字只代表性能。
 - #1、#2、#3 之后的 per-CU profile：`profiles/20261116_162253_monokernel_monoonly_cu_512-64_b1_csteps2`。
 
 ### 待做：gemv 阶段仍有空闲 CU（未实现）

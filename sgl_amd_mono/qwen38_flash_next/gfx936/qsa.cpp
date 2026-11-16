@@ -118,8 +118,30 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 400)) return;
     if (!run_mix(args.mix, 401)) return;
-    gemv(args.mix.output, args.qkv_weight, args.projected, nullptr, args.mix.rows, Hidden, 2048, 0);
-    gemv(args.mix.output, args.index_weight, args.index_projected, nullptr, args.mix.rows, Hidden, 640, 0);
+    // qkv (2560 -> 2048, 128 tiles per row) and index (2560 -> 640, 40 tiles per row) share one task
+    // space with pipelined loads; two plain gemv calls both started at wave 0, so waves 0-39 ran
+    // two tiles back to back (~148 us, 2026-11-16).
+    {
+        constexpr int QKVTiles = 2048 / 16;
+        constexpr int IndexTiles = 640 / 16;
+        int rows = args.mix.rows;
+        int wave = blockIdx.x * 4 + threadIdx.x / 64;
+        int lane = threadIdx.x & 63;
+        for (int task = wave; task < rows * (QKVTiles + IndexTiles); task += Blocks * 4) {
+            if (task < rows * QKVTiles) {
+                int row = task / QKVTiles;
+                int base = task % QKVTiles * 16;
+                float value = matvec16_pipelined(args.mix.output + row * Hidden, args.qkv_weight + int64_t(base) * Hidden);
+                if (lane < 16) args.projected[row * 2048 + base + lane] = BFloat16(value);
+            } else {
+                int index = task - rows * QKVTiles;
+                int row = index / IndexTiles;
+                int base = index % IndexTiles * 16;
+                float value = matvec16_pipelined(args.mix.output + row * Hidden, args.index_weight + int64_t(base) * Hidden);
+                if (lane < 16) args.index_projected[row * 640 + base + lane] = BFloat16(value);
+            }
+        }
+    }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 405)) return;
     for (int work = blockIdx.x; work < args.mix.rows * 4; work += Blocks) {
         int row = work / 4;
@@ -283,7 +305,7 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
         __syncthreads();
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 412)) return;
-    gemv(args.core, args.output_weight, args.output, nullptr, args.mix.rows, 768, Hidden, 0);
+    pipelined_gemv<768>(args.core, args.output_weight, args.output, args.mix.rows, Hidden);
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 413)) return;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         atomicAdd(args.executions, 1);

@@ -184,7 +184,7 @@ __global__ __launch_bounds__(Threads, 1) void gdn_attention(GDNArguments args) {
         __syncthreads();
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 312)) return;
-    gemv(args.core, args.output_weight, args.output, nullptr, rows, LocalCore, Hidden, 0);
+    pipelined_gemv<LocalCore>(args.core, args.output_weight, args.output, rows, Hidden);
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 313)) return;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         atomicAdd(args.executions, 1);
