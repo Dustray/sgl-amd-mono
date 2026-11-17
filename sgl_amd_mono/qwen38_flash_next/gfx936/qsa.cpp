@@ -93,7 +93,6 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
     __shared__ float normalized[QSADim];
     __shared__ float sort_scores[QSABlocks];
     __shared__ int sort_indices[QSABlocks];
-    __shared__ float probabilities[64];
     if (blockIdx.x < args.mix.rows) {
         int row = blockIdx.x;
         int length = args.sequence_lengths[row];
@@ -270,39 +269,55 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
         if (lane == 0) args.attention_scores[work] = score;
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 411)) return;
-    for (int work = blockIdx.x; work < args.mix.rows * QSAHeads; work += Blocks) {
+    // One wave per (row, head, 64-column chunk), spread one task per CU first (12 waves at b1).
+    // Each lane keeps the original per-column chain: max, normalizer and accumulator are updated
+    // token by token in the same order as the former one-block-per-head loop, so results are
+    // bit-identical. Per 64-token chunk every lane resolves one slot and all 64 value loads are
+    // issued before the fmaf chain; the old loop did three dependent global loads per token
+    // (~330 us on 3 CUs at b1, 2026-11-16).
+    for (int task = (threadIdx.x / 64) * Blocks + blockIdx.x; task < args.mix.rows * QSAHeads * 4; task += Blocks * 4) {
+        int work = task / 4;
+        int column = task % 4 * 64 + lane;
         int row = work / QSAHeads;
         int head = work % QSAHeads;
         int count = min(args.sequence_lengths[row] / 4, 512) * 4 + args.sequence_lengths[row] % 4;
+        const int32_t* tokens = args.request_tokens + args.requests[row] * args.request_stride;
         float maximum = -INFINITY;
         float normalizer = 0.0f;
         float accumulator = 0.0f;
         for (int start = 0; start < count; start += 64) {
-            if (threadIdx.x < 64) probabilities[threadIdx.x] = start + threadIdx.x < count ? args.attention_scores[work * QSABudget + start + threadIdx.x] : -INFINITY;
-            __syncthreads();
+            int valid = min(64, count - start);
+            float score = lane < valid ? args.attention_scores[work * QSABudget + start + lane] : -INFINITY;
+            int slot = lane < valid ? tokens[args.selected[row * QSABudget + start + lane]] : 0;
             float next_maximum = maximum;
-            for (int token = 0; token < 64; ++token) next_maximum = fmaxf(next_maximum, probabilities[token]);
+#pragma unroll
+            for (int token = 0; token < 64; ++token) next_maximum = fmaxf(next_maximum, __shfl(score, token, 64));
             float alpha = exp2f(maximum - next_maximum);
-            __syncthreads();
-            if (threadIdx.x < 64) probabilities[threadIdx.x] = exp2f(probabilities[threadIdx.x] - next_maximum);
-            __syncthreads();
+            float probability = exp2f(score - next_maximum);
             float total = 0.0f;
-            for (int token = 0; token < 64; ++token) total += probabilities[token];
+#pragma unroll
+            for (int token = 0; token < 64; ++token) total += __shfl(probability, token, 64);
             normalizer = normalizer * alpha + total;
             accumulator *= alpha;
-            for (int token = 0; token < min(64, count - start); ++token) {
-                int logical = args.selected[row * QSABudget + start + token];
-                int slot = args.request_tokens[args.requests[row] * args.request_stride + logical];
-                float value = float(args.value_cache[qsa_cache_offset(slot, threadIdx.x, args.value_page_stride, args.value_token_stride, args.value_dim_stride)]);
-                accumulator = fmaf(qsa_round(probabilities[token]), value, accumulator);
+            // 16 value loads in flight per batch; 64 at once needed 256 VGPRs and spilled.
+            for (int base = 0; base < valid; base += 16) {
+                float values[16];
+#pragma unroll
+                for (int token = 0; token < 16; ++token) {
+                    int token_slot = __shfl(slot, base + token, 64);
+                    values[token] = base + token < valid ? float(args.value_cache[qsa_cache_offset(token_slot, column, args.value_page_stride, args.value_token_stride, args.value_dim_stride)]) : 0.0f;
+                }
+#pragma unroll
+                for (int token = 0; token < 16; ++token) {
+                    float token_probability = qsa_round(__shfl(probability, base + token, 64));
+                    if (base + token < valid) accumulator = fmaf(token_probability, values[token], accumulator);
+                }
             }
             maximum = next_maximum;
-            __syncthreads();
         }
         float attention = qsa_round(accumulator / normalizer);
-        float gate = float(args.projected[row * 2048 + head * 512 + QSADim + threadIdx.x]);
-        args.core[work * QSADim + threadIdx.x] = BFloat16(attention * sigmoid(gate));
-        __syncthreads();
+        float gate = float(args.projected[row * 2048 + head * 512 + QSADim + column]);
+        args.core[work * QSADim + column] = BFloat16(attention * sigmoid(gate));
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 412)) return;
     pipelined_gemv<768>(args.core, args.output_weight, args.output, args.mix.rows, Hidden);

@@ -440,3 +440,24 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --c
 | 3. split-K | K 切 2 段写 FP32 部分和，在 conv state 阶段（z 部分在 recurrent 阶段）读取时求和，不用加 barrier | 258 个任务，配合做法 2 为 514 个 | **舍入会变**，不再和现在的 mono 逐位一致。qkvz 是连续值，不像 router 有离散跳变；native 用 hipBLAS，求和顺序本来就不同。要重跑 `verify_flash_next_gdn` 和对 native 的精度矩阵 |
 
 拆成每 wave 4 行（516 个任务，1.6 轮）负载反而不均，不建议。做法 3 之前，先用 stage 310 的时间算一下带宽：qkvz+ba 权重每层每卡约 10.5 MB（2060 × 2560 × 2 B）。如果已经接近 gfx936 实测的 HBM 带宽，铺到更多 CU 也快不了多少。
+
+### softmax+attn
+B1 512->64 #1: TTFT=693.9ms TPOT=33.15ms E2E=2.783s decode=30.16tok/s
+B1 512->64 #2: TTFT=578.0ms TPOT=32.80ms E2E=2.644s decode=30.49tok/s
+B1 512->64 #3: TTFT=578.0ms TPOT=32.80ms E2E=2.644s decode=30.49tok/s
+
+##### Flash-Next TP8 BF16 | mode=mono | graph=off | repeats=3
+
+| batch | in→out | TTFT ms | TPOT ms | E2E s | prefill ms | decode tok/s | output tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 512→64 | 616.62 | 32.92 | 2.69 | 609.91 | 30.38 | 23.80 |
+开启graph：
+B1 512->64 #1: TTFT=586.1ms TPOT=28.86ms E2E=2.404s decode=34.65tok/s
+B1 512->64 #2: TTFT=598.7ms TPOT=29.67ms E2E=2.468s decode=33.70tok/s
+B1 512->64 #3: TTFT=576.1ms TPOT=28.97ms E2E=2.401s decode=34.52tok/s
+
+# Flash-Next TP8 BF16 | mode=mono | graph=on | repeats=3
+
+| batch | in→out | TTFT ms | TPOT ms | E2E s | prefill ms | decode tok/s | output tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 512→64 | 586.97 | 29.17 | 2.42 | 581.66 | 34.29 | 26.40 |
