@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next BF16：原生 vs Monokernel 性能
 
-更新：2026-11-16（主表性能数据为 11-10，算子修改记录见文末）。
+更新：2026-11-17（11-16–11-17 一批算子优化（#1–#10）后，Mono 已快于原生 + Graph，见"结论"和"最新性能"；batch 1 / batch 2 全长度矩阵仍是优化前（11-09 / 11-10）数据，待重测）。
 
 ## 环境基本信息
 
@@ -21,10 +21,11 @@ Monokernel 支持的模型中，唯一一个 Qwen 模型是 Qwen3.8-Flash-Next�
 
 ## 结论
 
-- **原生开 Graph 是最快的，Mono 追不上。** 原生 + Graph 每个 token 约 45–49 ms；Mono 就算也开 Graph 也要约 86–103 ms，端到端比它慢 1.1–1.9 倍（batch 1）、1.2–2.1 倍（batch 2）。瓶颈是 Mono kernel 本身的计算速度。
-- **两边都不开 Graph 时，Mono 快 2–3 倍。** 每个 token 从约 246 ms 降到约 91–107 ms。这说明融合本身有效果，但收益比原生开 Graph 小。
-- **Mono 开 Graph 只再快约 5 个百分点。** Mono 每步本来只有 99 次 kernel 发射，Graph 能省的发射开销很少。
-- **Mono 的完整精度验收还没通过**（和原生逐步对照时，部分步骤的分布差异超过门槛），下面的数字只代表性能。
+- **11-16–11-17 一批算子优化后，Mono 已经比原生 + Graph 快。** batch 1、512→64：优化后 Mono 不开 Graph TPOT **32.9 ms**，开 Graph **29.2 ms**；原生 + Graph 为 45.5 ms（11-10），即单 token 快约 28% / 36%。优化前 Mono 是 94.7 / 90.1 ms，追不上原生 + Graph。
+- **优化前瓶颈是 kernel 内有大量"任务太少、只有几个 block 在算、其余 block 在 grid barrier 里等"的阶段**（mix.down、top-10 选择、各处 gemv、softmax+attn 等）；这一轮把它们改成 split-K / 双缓冲流水 gemv / wave 内并行，见文末"Mono 算子修改记录"（#1–#10）。
+- **Graph 对 Mono 的收益一直有限：** 优化前约 5%（94.7 → 90.1 ms），优化后约 11%（32.9 → 29.2 ms）。Mono 每步只有 99 次 kernel 发射，Graph 能省的发射开销少。
+- **Mono 的完整精度验收还没通过**（和原生逐步对照时，部分步骤的分布差异超过门槛）；算子优化里只有 #1 验证过逐位一致，#2–#10 未验证。文中数字只代表性能。
+- 下文 batch 1 / batch 2 全长度矩阵均为**优化前**基线数据，优化后的全矩阵和 batch 2 的 Mono + Graph 待重测。
 
 ## 测试配置
 
@@ -45,7 +46,29 @@ Monokernel 支持的模型中，唯一一个 Qwen 模型是 Qwen3.8-Flash-Next�
 - **E2E**：从发出请求到这一轮全部请求结束。
 - **Decode tok/s**：batch × (输出数 − 1) / decode 时间。
 
-## batch 1, 512→64，四种模式
+## 最新性能（11-16–11-17，算子 #1–#10 后，batch 1，512→64）
+
+| 模式 | TTFT ms | TPOT ms | E2E s | prefill ms | decode tok/s | output tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Mono（#1–#9，11-16） | 584 | 34.48 | 2.76 | 578.40 | 29.00 | 23.22 |
+| Mono（#1–#10，不开 Graph） | 616.62 | **32.92** | 2.69 | 609.91 | 30.38 | 23.80 |
+| Mono（#1–#10，开 Graph） | 586.97 | **29.17** | **2.42** | 581.66 | **34.29** | 26.40 |
+| 参照：原生 + Graph（11-10） | 660 | 45.5 | 3.53 | — | 21.96 | — |
+
+3 轮明细（每组 `--repeats 3`）：
+
+| 版本 | 轮次 | TTFT ms | TPOT ms | E2E s | decode tok/s |
+|---|---:|---:|---:|---:|---:|
+| #1–#10 不开 Graph | 1 | 693.9 | 33.15 | 2.783 | 30.16 |
+| | 2 | 578.0 | 32.80 | 2.644 | 30.49 |
+| | 3 | 578.0 | 32.80 | 2.644 | 30.49 |
+| #1–#10 开 Graph | 1 | 586.1 | 28.86 | 2.404 | 34.65 |
+| | 2 | 598.7 | 29.67 | 2.468 | 33.70 |
+| | 3 | 576.1 | 28.97 | 2.401 | 34.52 |
+
+不开 Graph 的第 2、3 轮四个指标完全相同，疑似记录重复，建议重跑确认。数据在 `bench_results/20261111_monokernel_eager_b1_512-64-12362`（不开 Graph）、`…-12348`（开 Graph）；#1–#9 的数据在 `…-1234`。#2–#10 的逐位一致还没验证，这些数字只代表性能。
+
+## batch 1, 512→64，四种模式（优化前基线，11-09 / 11-10）
 
 | 模式 | TTFT ms | TPOT ms | E2E s | Decode tok/s |
 |---|---:|---:|---:|---:|
@@ -54,9 +77,9 @@ Monokernel 支持的模型中，唯一一个 Qwen 模型是 Qwen3.8-Flash-Next�
 | Mono | 633 | 94.7 | 6.60 | 10.56 |
 | Mono + Graph | 588 | 90.1 | 6.27 | 11.09 |
 
-## batch 1 全部长度
+## batch 1 全部长度（优化前基线，11-09 / 11-10）
 
-每格四个数的顺序是 **原生 / 原生+Graph / Mono / Mono+Graph**。
+下面的表都是**算子优化前**的基线，优化后的全矩阵待重测。每格四个数的顺序是 **原生 / 原生+Graph / Mono / Mono+Graph**。
 
 | 输入→输出 | TTFT ms | TPOT ms | E2E s | Decode tok/s | Mono+Graph 耗时 ÷ 原生+Graph 耗时（E2E） |
 |---|---:|---:|---:|---:|---:|
@@ -71,9 +94,9 @@ Monokernel 支持的模型中，唯一一个 Qwen 模型是 Qwen3.8-Flash-Next�
 | 2048→64 | 2520 / 2784 / 2517 / 2369 | 251.6 / 49.0 / 107.2 / 102.7 | 18.37 / 5.87 / 9.27 / 8.84 | 3.98 / 20.43 / 9.33 / 9.73 | 1.51× |
 | 2048→128 | 2477 / 2713 / 2531 / 2340 | 247.6 / 48.8 / 107.3 / 102.9 | 33.93 / 8.92 / 16.16 / 15.40 | 4.04 / 20.47 / 9.32 / 9.72 | 1.73× |
 
-## batch 2 全部长度
+## batch 2 全部长度（优化前基线，11-09 / 11-10）
 
-每格三个数的顺序是 **原生 / 原生+Graph / Mono**。Mono + Graph 还没测 batch 2。
+每格三个数的顺序是 **原生 / 原生+Graph / Mono**。Mono + Graph 还没测 batch 2，整张表是优化前数据，待重测。
 
 | 输入→输出 | TTFT ms | TPOT ms | E2E s | Decode tok/s（2 路合计） | Mono 耗时 ÷ 原生+Graph 耗时（E2E） |
 |---|---:|---:|---:|---:|---:|
@@ -92,12 +115,11 @@ batch 2 的两个请求同时发出，但 prefill 是一个接一个做的。前
 
 ## 数据来源和注意事项
 
-- 原生、Mono（都不开 Graph）：11-09 测的，两种模式共用同一个服务进程，输入完全相同。
-- Mono + Graph：11-10，用的是同一份输入。
-- 原生 + Graph：11-10，用 `bench_flash_next.py` 测的。随机输入和上面几组不同，长度相同；这对 decode 速度基本没影响，但 TTFT 不适合和上面几组逐个比较。
+- 主表（batch 1 / batch 2 全长度、四种模式）：原生、Mono（都不开 Graph）为 11-09 测的，两种模式共用同一个服务进程，输入完全相同；Mono + Graph 为 11-10，同一份输入；原生 + Graph 为 11-10，用 `bench_flash_next.py` 测的，随机输入和上面几组不同、长度相同，对 decode 速度基本没影响，但 TTFT 不适合和上面几组逐个比较。这些都是**算子优化前**的基线。
+- “最新性能”一节（batch 1，512→64）：11-16–11-17，算子 #1–#10 之后，`bench_flash_next.py` 测的，目录见该节末尾。与主表的 Mono 数字是不同代码版本，不要跨表混用。
 - 之前常提的“原生 Graph 约 24.7 tok/s”用的是 FP8 KV + FA3 + AITER，还开了 overlap 和 radix，和这里的 BF16 配置不同，所以没放进表里。
 - 每组只测 3 次，单个数字有波动，不适合用来估 P95 / P99。
-- 还缺 Mono + Graph 的 batch 2 数据。
+- 还缺：算子优化后的 batch 1 / batch 2 全长度矩阵，和 Mono + Graph 的 batch 2 数据。
 
 ## 怎么测
 
@@ -355,9 +377,9 @@ python3 tools/verify_flash_next_cu_timing.py --device 0 --launches 4
 11-13 在 card 0 上：80 个 block 落在 80 个不同的 CU 上，每 block 36 个打点，没有丢失；`hc_mix` 每次 launch 每个 CU 约 23 us 在算、约 361 us 在 grid barrier 里等。
 
 
-## Mono 算子修改记录（11-16）
+## Mono 算子修改记录（11-16–11-17，#1–#10）
 
-下面几处改动都是同一类问题：某个阶段的任务数太少，只有少数几个 block 在算，其余 block 停在 grid barrier 里等。per-CU trace 里看到的“某几个 CU 特别长”就是这几个 block 所在的 CU（block 每次 launch 落在不同 CU 上，所以每层长的 CU 不一样）。
+下面几处改动都是同一类问题：某个阶段的任务数太少，只有少数几个 block 在算，其余 block 停在 grid barrier 里等；或者任务数够但每个 wave 内是串行的 load-等待。per-CU trace 里看到的“某几个 CU 特别长”就是这几个 block 所在的 CU（block 每次 launch 落在不同 CU 上，所以每层长的 CU 不一样）。
 
 trace 里的阶段名按“结束于哪个 barrier”命名，和实际内容有出入：post kernel 的 `router.top10`（stage 40）实际是 **router gemv**，`shared gate`（stage 41）实际是 **top-10 选择 + shared gate gemv**。
 
@@ -372,26 +394,35 @@ trace 里的阶段名按“结束于哪个 barrier”命名，和实际内容有
 | 7 | `normalize`（HC 4 个分支的 RMSNorm，post / gdn / qsa 的 `mix.normalize`，stage 30 / 300 / 401） | b1 只有 4 个任务，全挤在 block 0 的 4 个 wave 上，每个 lane 串行 load 40 次；post 约 **30.6 us/层**，gdn 约 37 us，qsa 约 36.5 us，合计约 3.2 ms/步 | 任务改为先横向铺到不同 block（`wave = wave_in_block * Blocks + blockIdx.x`）；每个 lane 一次 load 完 40 个值放寄存器，平方和与输出两遍都复用 | 每个任务仍由一个 wave 算完，每个 lane 的求和顺序和输出表达式不变，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
 | 8 | QSA `qkv+index gemv`（2560→2048 + 2560→640，qsa kernel，stage 405） | 两次普通 gemv 都从 wave 0 开始，wave 0–39 串行做两个 tile；约 **148 us/层** × 12 = 1.75 ms/步 | 同 #4：两个 gemv 合进一个任务空间（qkv 168 个任务中前 128 个，index 在后），都用 `matvec16_pipelined` | 同 #3，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
 | 9 | GDN / QSA `output gemv`（768→2560，stage 313 / 413） | `matvec16` 串行 load；gdn 约 25 us，qsa 约 29 us | `matvec16_pipelined` 加模板参数 `Width`（K=768 也能用），新增 `pipelined_gemv<Width>`，tile 到 wave 的映射与 `gemv` 相同 | 同 #3，按设计应逐位一致 | 已编译运行，逐位一致**尚未验证** |
+| 10 | QSA `softmax+attn`（qsa kernel，stage 412） | b1 只有 3 个任务（3 个 head），一个 block 一个任务；block 内 64 个线程一组一组处理 64 个 token，每组两次经 shared memory 往返 + `__syncthreads`，value 累加每 token 3 次依赖 global load 串行；约 **330 us/层** × 12 = 3.96 ms/步 | 每个 (row, head, 64 列 chunk) 一个 wave（b1 共 12 个任务，先横铺到不同 CU）。每个 lane 固定一列，score / slot 用 wave 内 `__shfl` 广播，不再走 shared memory；64 个 value load 提前发出（16 个在飞，一次发 64 个要 256 VGPR 会 spill） | 每个 lane 的 max / normalizer / accumulator 仍按 token 原顺序逐 token 累加，表达式不变，按设计应逐位一致 | 已编译运行（11-17），TPOT 34.48 → 32.92 ms（不开 Graph）/ 29.17 ms（开 Graph）。逐位一致**尚未验证**，stage 412 还需复测一次 per-CU profile |
 
-#6–#9 的改前数据来自 `profiles/20261116_173021_monokernel_monoonly_cu_512-64_b1_csteps2`（rank 0，2 个 decode step）。
+#1 的改前数据来自 `profiles/20261116_150357_monokernel_monoonly_cu_512-64_b1_csteps2`，#6–#10 的改前数据来自 `profiles/20261116_173021_monokernel_monoonly_cu_512-64_b1_csteps2`（均 rank 0，2 个 decode step × 48 层，per-CU 计时）。
 
-还没做的较大项（同一份 profile）：
-- QSA `softmax+attn`（stage 412）：约 **330 us/层** × 12 = 3.96 ms/步，是现在最大的一段。b1 只有 3 个任务（3 个 head），每个 block 内 256 个线程对每组 64 个 token 串行做 max、求和和 value 累加。可以在保持 `normalizer` / `accumulator` 累加顺序不变的前提下并行化。
+关于 #3：要让 80 个 block 都参与 router gemv，只能做跨 wave 的 split-K，但这会改变 router logits 的舍入。路由边界（第 10/11 个专家）打平本来就是已知的精度问题，所以这次没有做 split-K。
+
+### 还没做的较大项
+
+来自同一份改前 profile（`20261116_173021…`）：
+
 - `attn.reduce` / `moe.reduce`（stage 13 / 53）：各约 25 us/层，时间花在跨 8 卡的 system-scope atomic load 等待上，改计算没用。
 - QSA `top512 select`（stage 410）：约 86 us/层，bitonic 排序，改排序网络会影响 tie-break。
+- `qkvz+ba gemv` 的 CU 占用率：见下文“待做：gemv 阶段仍有空闲 CU”。
 
-关于第 3 项：要让 80 个 block 都参与 router gemv，只能做跨 wave 的 split-K，但这会改变 router logits 的舍入。路由边界（第 10/11 个专家）打平本来就是已知的精度问题，所以这次没有做 split-K。
+原列表里最大的 QSA `softmax+attn`（约 3.96 ms/步）已在 11-17 作为 #10 改掉。
 
-改前的数据来自 `profiles/20261116_150357_monokernel_monoonly_cu_512-64_b1_csteps2`（rank 0，2 个 decode step × 48 层，per-CU 计时）。第 2、3 项待做的验证：
+### 待做验证（#2–#10 的逐位一致）
 
 ```bash
-python3 tools/verify_flash_next_moe.py            # router logits / top_ids / top_weights 与改前逐位一致
+python3 tools/verify_flash_next_moe.py            # router logits / top_ids / top_weights 与改前逐位一致（#2、#3）
+python3 tools/verify_flash_next_gdn.py            # #4、#9、#10 涉及的 GDN/QSA 输出
 python3 tools/verify_flash_next_cu_timing.py --device 0 --launches 4
 python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --cu-stages --cu-steps 2 --mono-only \
-  --input-tokens 512 --output-tokens 64 --output-dir <目录>   # 看 stage 40/41 是否变短
+  --input-tokens 512 --output-tokens 64 --output-dir <目录>   # 看 stage 40/41/412 是否变短
 ```
 
-### 改动后的端到端性能（11-16，batch 1，512→64，Mono 不开 Graph）
+### 改动后的端到端性能（11-16–11-17，batch 1，512→64）
+
+除最后一行外都是 Mono 不开 Graph：
 
 | 版本 | TTFT ms | TPOT ms | E2E s | decode tok/s |
 |---|---:|---:|---:|---:|
@@ -399,7 +430,9 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --c
 | 11-16 前一次测量（#1、#2） | 604 | 45.03 | 3.44 | 22.21 |
 | 11-16（#1、#2、#3） | 587 | 43.09 | 3.30 | 23.21 |
 | 11-16（#1–#4） | 597 | 40.37 | 3.14 | 24.77 |
-| **11-16 最新（#1–#9）** | **584** | **34.48** | **2.76** | **29.00** |
+| 11-16（#1–#9） | 584 | 34.48 | 2.76 | 29.00 |
+| **11-17（#1–#10）** | **617** | **32.92** | **2.69** | **30.38** |
+| **11-17（#1–#10，开 Graph）** | **587** | **29.17** | **2.42** | **34.29** |
 | 参照：原生 + Graph（11-10，主表） | 660 | 45.5 | 3.53 | 21.96 |
 
 3 轮明细：
@@ -415,12 +448,20 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --c
 | #1–#9 | 1 | 580.6 | 34.48 | 2.753 | 29.01 |
 | | 2 | 573.5 | 34.38 | 2.740 | 29.08 |
 | | 3 | 598.7 | 34.57 | 2.777 | 28.92 |
+| #1–#10 不开 Graph | 1 | 693.9 | 33.15 | 2.783 | 30.16 |
+| | 2 | 578.0 | 32.80 | 2.644 | 30.49 |
+| | 3 | 578.0 | 32.80 | 2.644 | 30.49 |
+| #1–#10 开 Graph | 1 | 586.1 | 28.86 | 2.404 | 34.65 |
+| | 2 | 598.7 | 29.67 | 2.468 | 33.70 |
+| | 3 | 576.1 | 28.97 | 2.401 | 34.52 |
 
-#1、#2、#3：prefill 581.07 ms，output tok/s 19.38，数据在 `bench_results/20261111_monokernel_eager_b1_512-64-1/`。#1–#4：prefill 590.22 ms，output tok/s 20.38。#1–#9：prefill 578.40 ms，output tok/s 23.22。
+不开 Graph 的 #1–#10 第 2、3 轮四个指标完全相同，疑似记录重复，建议重跑确认。
 
-- Mono 不开 Graph 的 TPOT 从 94.7 ms 降到 34.48 ms（−64%），比原生 + Graph 的 45.5 ms 快约 24%。#5–#9 这一轮从 40.37 ms 降到 34.48 ms（−5.9 ms/token）。
-- 精度：#1 已验证逐位一致；#2–#9 的逐位一致还没验证，这些数字只代表性能。
-- #1、#2、#3 之后的 per-CU profile：`profiles/20261116_162253_monokernel_monoonly_cu_512-64_b1_csteps2`。
+各版本 prefill / output tok/s 与数据目录：#1–#3：prefill 581.07 ms、output tok/s 19.38（`bench_results/20261111_monokernel_eager_b1_512-64-1/`）；#1–#4：prefill 590.22 ms、output tok/s 20.38；#1–#9：prefill 578.40 ms、output tok/s 23.22（`…-1234`）；#1–#10 不开 Graph：prefill 609.91 ms、output tok/s 23.80（`…-12362`）；#1–#10 开 Graph：prefill 581.66 ms、output tok/s 26.40（`…-12348`）。
+
+- Mono 不开 Graph 的 TPOT 从 94.7 ms 降到 32.92 ms（−65%），比原生 + Graph 的 45.5 ms 快约 28%；开 Graph 后 29.17 ms，快约 36%。各步增益：#5–#9 这一轮 −5.9 ms/token（40.37 → 34.48），#10 再 −1.6 ms（不开 Graph）/ 开 Graph 增益约 11%（3.75 ms）。
+- 精度：#1 已验证逐位一致；#2–#10 的逐位一致还没验证，这些数字只代表性能。
+- #1、#2、#3 之后的 per-CU profile：`profiles/20261116_162253_monokernel_monoonly_cu_512-64_b1_csteps2`。#10 之后还没重新采 per-CU profile（看 stage 412 是否变短）。
 
 ### 待做：gemv 阶段仍有空闲 CU（未实现）
 
@@ -440,24 +481,3 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --decode-graph --c
 | 3. split-K | K 切 2 段写 FP32 部分和，在 conv state 阶段（z 部分在 recurrent 阶段）读取时求和，不用加 barrier | 258 个任务，配合做法 2 为 514 个 | **舍入会变**，不再和现在的 mono 逐位一致。qkvz 是连续值，不像 router 有离散跳变；native 用 hipBLAS，求和顺序本来就不同。要重跑 `verify_flash_next_gdn` 和对 native 的精度矩阵 |
 
 拆成每 wave 4 行（516 个任务，1.6 轮）负载反而不均，不建议。做法 3 之前，先用 stage 310 的时间算一下带宽：qkvz+ba 权重每层每卡约 10.5 MB（2060 × 2560 × 2 B）。如果已经接近 gfx936 实测的 HBM 带宽，铺到更多 CU 也快不了多少。
-
-### softmax+attn
-B1 512->64 #1: TTFT=693.9ms TPOT=33.15ms E2E=2.783s decode=30.16tok/s
-B1 512->64 #2: TTFT=578.0ms TPOT=32.80ms E2E=2.644s decode=30.49tok/s
-B1 512->64 #3: TTFT=578.0ms TPOT=32.80ms E2E=2.644s decode=30.49tok/s
-
-##### Flash-Next TP8 BF16 | mode=mono | graph=off | repeats=3
-
-| batch | in→out | TTFT ms | TPOT ms | E2E s | prefill ms | decode tok/s | output tok/s |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 512→64 | 616.62 | 32.92 | 2.69 | 609.91 | 30.38 | 23.80 |
-开启graph：
-B1 512->64 #1: TTFT=586.1ms TPOT=28.86ms E2E=2.404s decode=34.65tok/s
-B1 512->64 #2: TTFT=598.7ms TPOT=29.67ms E2E=2.468s decode=33.70tok/s
-B1 512->64 #3: TTFT=576.1ms TPOT=28.97ms E2E=2.401s decode=34.52tok/s
-
-# Flash-Next TP8 BF16 | mode=mono | graph=on | repeats=3
-
-| batch | in→out | TTFT ms | TPOT ms | E2E s | prefill ms | decode tok/s | output tok/s |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 512→64 | 586.97 | 29.17 | 2.42 | 581.66 | 34.29 | 26.40 |

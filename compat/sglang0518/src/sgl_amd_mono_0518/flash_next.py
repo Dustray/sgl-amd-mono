@@ -103,15 +103,72 @@ def _graph_execute(original, runner, batch, *args, **kwargs):
     return original(runner, batch, *args, **kwargs)
 
 
+class _NoBeamCoordinator:
+    """Stand-in for the beam coordinator that this SGLang build references but never creates.
+
+    0.5.18+dtk2604 `Scheduler.abort_request` calls `self.beam_coordinator.retire_group(req)` for
+    every request it pops from the waiting queue, but nothing ever sets `beam_coordinator`, so
+    aborting a queued request (client timeout/disconnect) crashes all TP schedulers with
+    AttributeError. Beam search is not used here, so there is no beam group to retire.
+    """
+
+    def retire_group(self, req):
+        return None
+
+
+def _make_abort_req(req, finished_reason=None):
+    """Missing helper of 0.5.18+dtk2604 `scheduler.py`, called on queued and chunked-prefill aborts.
+
+    Builds the same `AbortReq` as the other abort sites in that file (rid plus optional
+    `finished_reason` dict); without a reason the tokenizer reports "Abort in waiting queue".
+    """
+    from sglang.srt.managers.io_struct import AbortReq
+
+    return AbortReq(rid=req.rid, finished_reason=finished_reason)
+
+
+def install_scheduler_fixes(scheduler, *args, **kwargs):
+    """Fill in names that this SGLang build references but never defines; no-op once SGLang has them."""
+    if not hasattr(scheduler, "beam_coordinator"):
+        scheduler.beam_coordinator = _NoBeamCoordinator()
+    import sglang.srt.managers.scheduler as scheduler_module
+
+    if not hasattr(scheduler_module, "_make_abort_req"):
+        scheduler_module._make_abort_req = _make_abort_req
+    return None
+
+
+_scheduler_fix_registered = False
+
+# run_event_loop installs the fixes before any request (the chunked-prefill abort path can be
+# reached without abort_request); abort_request keeps them in place for direct callers.
+_SCHEDULER_FIX_TARGETS = (
+    "sglang.srt.managers.scheduler.Scheduler.run_event_loop",
+    "sglang.srt.managers.scheduler.Scheduler.abort_request",
+)
+
+
+def _register_scheduler_fixes(HookRegistry, HookType):
+    global _scheduler_fix_registered
+
+    if _scheduler_fix_registered:
+        return
+    for target in _SCHEDULER_FIX_TARGETS:
+        HookRegistry.register(target, install_scheduler_fixes, HookType.BEFORE)
+    _scheduler_fix_registered = True
+
+
 def register():
     global _registered
 
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+    # Needed by native runs too, so it sits before the Flash-Next opt-in gate.
+    _register_scheduler_fixes(HookRegistry, HookType)
     if _registered or not any(os.environ.get(name, "0") == "1" for name in ("SGLANG_AMD_FLASH_NEXT_0518", "SGLANG_AMD_FLASH_ACCURACY_REFERENCE", "SGLANG_AMD_PROFILE_RANGES")):
         return
     if os.environ.get("SGLANG_AMD_MONO_0518", "0") != "0":
         raise RuntimeError("Select either Flash-Next or the dense 27B compatibility plugin")
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
     if os.environ.get("SGLANG_AMD_PROFILE_EVENT_DIR"):
         from sgl_amd_mono.common.profiling import register_frontend_ranges
 

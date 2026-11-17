@@ -198,3 +198,74 @@ def test_experiment_preserves_state_layout_guards(model_path, device, monkeypatc
     assert not report["monokernel_eligible"]
     with pytest.raises(contract.UnsupportedConfiguration):
         contract.validate(report, "monokernel")
+
+
+class _AbortingScheduler:
+    def abort_request(self, req):
+        # Mirrors the 0.5.18+dtk2604 waiting-queue abort path.
+        self.beam_coordinator.retire_group(req)
+        return "aborted"
+
+
+def test_beam_coordinator_fix_registered_without_flash_next_env(monkeypatch):
+    from collections import defaultdict
+
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    from sgl_amd_mono_0518 import flash_next
+
+    for name in ("SGLANG_AMD_FLASH_NEXT_0518", "SGLANG_AMD_FLASH_ACCURACY_REFERENCE", "SGLANG_AMD_PROFILE_RANGES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(HookRegistry, "_hooks", defaultdict(list))
+    monkeypatch.setattr(flash_next, "_scheduler_fix_registered", False)
+    monkeypatch.setattr(flash_next, "_registered", False)
+    flash_next.register()
+    flash_next.register()
+    assert dict(HookRegistry._hooks) == {
+        target: [(HookType.BEFORE, flash_next.install_scheduler_fixes, None)] for target in flash_next._SCHEDULER_FIX_TARGETS
+    }
+    assert flash_next._registered is False
+
+
+def test_beam_coordinator_fix_lets_queued_abort_complete(monkeypatch):
+    from collections import defaultdict
+
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    from sgl_amd_mono_0518 import flash_next
+
+    target = f"{__name__}._AbortingScheduler.abort_request"
+    original = _AbortingScheduler.abort_request
+    monkeypatch.setattr(HookRegistry, "_hooks", defaultdict(list))
+    monkeypatch.setattr(HookRegistry, "_patched", set())
+    with pytest.raises(AttributeError, match="beam_coordinator"):
+        _AbortingScheduler().abort_request(object())
+    try:
+        HookRegistry.register(target, flash_next.install_scheduler_fixes, HookType.BEFORE)
+        HookRegistry.apply_hooks()
+        assert _AbortingScheduler().abort_request(object()) == "aborted"
+        retired = []
+        scheduler = _AbortingScheduler()
+        scheduler.beam_coordinator = SimpleNamespace(retire_group=retired.append)
+        scheduler.abort_request("req")
+        assert retired == ["req"]
+    finally:
+        _AbortingScheduler.abort_request = original
+
+
+def test_scheduler_fix_defines_make_abort_req(monkeypatch):
+    import sglang.srt.managers.scheduler as scheduler_module
+    from sglang.srt.managers.io_struct import AbortReq
+    from sgl_amd_mono_0518 import flash_next
+
+    monkeypatch.delattr(scheduler_module, "_make_abort_req", raising=False)
+    scheduler = object.__new__(scheduler_module.Scheduler)
+    flash_next.install_scheduler_fixes(scheduler)
+    req = SimpleNamespace(rid="r1")
+    plain = scheduler_module._make_abort_req(req)
+    assert isinstance(plain, AbortReq) and plain.rid == "r1" and plain.finished_reason is None
+    reason = {"type": "abort", "message": "Aborted"}
+    assert scheduler_module._make_abort_req(req, finished_reason=reason).finished_reason == reason
+    # An existing SGLang helper is left alone.
+    sentinel = object()
+    monkeypatch.setattr(scheduler_module, "_make_abort_req", sentinel)
+    flash_next.install_scheduler_fixes(scheduler)
+    assert scheduler_module._make_abort_req is sentinel
