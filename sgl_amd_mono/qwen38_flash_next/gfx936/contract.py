@@ -49,9 +49,13 @@ def validate_sources():
     return {"versions": expected["versions"], "sglang_source_sha256": hashes}
 
 
+QSA_CONTEXT_CAP = 64 * 4096
+
+
 def validate_server(server_args):
     report = inspect_model(server_args.model_path, server_args.tp_size)
-    if os.environ.get("SGLANG_AMD_FLASH_NEXT_0518") == "1" and os.environ.get("SGLANG_USE_FUSED_TOPK_SOFTMAX", "0").lower() in ("1", "true"):
+    mono = os.environ.get("SGLANG_AMD_FLASH_NEXT_0518") == "1"
+    if mono and os.environ.get("SGLANG_USE_FUSED_TOPK_SOFTMAX", "0").lower() in ("1", "true"):
         report["disable_reasons"].append("SGLANG_USE_FUSED_TOPK_SOFTMAX=1 is not numerically validated for Flash-Next fusion; use 0")
     unsupported = [name for name in ("enable_lora", "enable_torch_compile", "enable_dp_attention", "enable_dp_lm_head", "enable_deterministic_inference", "speculative_algorithm", "enable_linear_replayssm", "enable_unified_memory", "enable_return_hidden_states", "enable_return_routed_experts", "enable_return_indexer_topk", "ple_offload_embedding", "enable_two_batch_overlap", "enable_single_batch_overlap") if getattr(server_args, name, None)]
     if unsupported:
@@ -61,8 +65,10 @@ def validate_server(server_args):
             report["disable_reasons"].append(f"requires {name}=1")
     if not getattr(server_args, "disable_overlap_schedule", False):
         report["disable_reasons"].append("requires --disable-overlap-schedule")
-    if getattr(server_args, "context_length", None) is None or not 1 <= server_args.context_length <= 4096:
-        report["disable_reasons"].append("requires explicit context length <= 4096")
+    # The QSA index top-k sorts 4096-token chunks and merges up to 64 of them (qsa.cpp QSAChunkLists);
+    # native decode has no such limit.
+    if mono and (getattr(server_args, "context_length", None) is None or not 1 <= server_args.context_length <= QSA_CONTEXT_CAP):
+        report["disable_reasons"].append(f"requires explicit context length <= {QSA_CONTEXT_CAP}")
     if getattr(server_args, "max_running_requests", None) not in (1, 2):
         report["disable_reasons"].append("requires max-running-requests 1 or 2")
     if str(getattr(server_args, "dtype", None)) not in ("bfloat16", "bf16"):

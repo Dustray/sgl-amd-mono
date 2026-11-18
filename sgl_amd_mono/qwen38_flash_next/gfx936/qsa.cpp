@@ -4,9 +4,14 @@ constexpr int QSADim = 256;
 constexpr int QSAHeads = 3;
 constexpr int IndexDim = 128;
 constexpr int IndexHeads = 4;
-constexpr int QSAContext = 4096;
-constexpr int QSABlocks = 1024;
-constexpr int QSABudget = 2051;
+// The index top-k ran as one 1024-wide bitonic sort, which pinned the kernel to 4096 context.
+// Long contexts sort chunks of QSABlocks groups in one block each and merge the per-chunk
+// best-of-QSATopK lists pairwise (see qsa_attention).
+constexpr int QSABlocks = 1024;       // 4-token groups per chunk (context covered per sort block)
+constexpr int QSAChunkLists = 64;     // max chunks per row (power of two) -> context cap 262144
+constexpr int QSATopK = 512;          // blocks kept by the index top-k
+constexpr int QSABudget = 2051;       // QSATopK * 4 + 3 partial tokens
+static_assert(QSABlocks == 2 * QSATopK, "pairwise merge packs two top-k lists into one sort block");
 
 struct QSAArguments {
     MixArguments mix;
@@ -34,6 +39,10 @@ struct QSAArguments {
     BFloat16* index_queries;
     float* index_scores;
     int32_t* selected;
+    float* chunk_scores;
+    int32_t* chunk_indices;
+    float* merge_scores;
+    int32_t* merge_indices;
     float* attention_scores;
     BFloat16* core;
     BFloat16* output;
@@ -51,6 +60,8 @@ struct QSAArguments {
     int64_t value_page_stride;
     int64_t value_token_stride;
     int64_t value_dim_stride;
+    int64_t qsa_lists;
+    int64_t context_limit;
 };
 
 __device__ __forceinline__ float qsa_round(float value) { return float(BFloat16(value)); }
@@ -93,27 +104,31 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
     __shared__ float normalized[QSADim];
     __shared__ float sort_scores[QSABlocks];
     __shared__ int sort_indices[QSABlocks];
-    if (blockIdx.x < args.mix.rows) {
-        int row = blockIdx.x;
+    // Row checks run on block `row`; the slot table scan (length entries, up to the context cap)
+    // is spread over the whole grid so a long context does not serialize on one CU.
+    for (int row = 0; row < args.mix.rows; ++row) {
         int length = args.sequence_lengths[row];
         int64_t request = args.requests[row];
         int64_t location = args.locations[row];
-        bool valid = length > 0 && length <= QSAContext && request >= 0 && request < args.request_count;
+        bool valid = length > 0 && length <= args.context_limit && request >= 0 && request < args.request_count;
         valid = valid && location >= 0 && location < args.cache_slots && request * 4 + 3 < args.ring_slots;
-        for (int axis = 0; axis < args.position_axes; ++axis) {
-            int64_t position = args.positions[axis * args.position_axis_stride + row];
-            valid = valid && position >= 0 && position < args.rotary_rows;
+        if (blockIdx.x == row) {
+            bool owned = valid;
+            for (int axis = 0; axis < args.position_axes; ++axis) {
+                int64_t position = args.positions[axis * args.position_axis_stride + row];
+                owned = owned && position >= 0 && position < args.rotary_rows;
+            }
+            owned = owned && args.request_tokens[request * args.request_stride + length - 1] == location;
+            bool reserved = request == 0 && location == 0;
+            if (!reserved && args.mix.rows == 2 && row == 0 && (args.requests[0] == args.requests[1] || args.locations[0] == args.locations[1])) owned = false;
+            if (!owned) atomicCAS(args.mix.synchronization + 2, 0u, 400u);
         }
         if (valid) {
-            valid = args.request_tokens[request * args.request_stride + length - 1] == location;
-            for (int token = threadIdx.x; token < length; token += Threads) {
+            for (int token = blockIdx.x * Threads + threadIdx.x; token < length; token += Blocks * Threads) {
                 int slot = args.request_tokens[request * args.request_stride + token];
-                if (slot < 0 || slot >= args.cache_slots) valid = false;
+                if (slot < 0 || slot >= args.cache_slots) atomicCAS(args.mix.synchronization + 2, 0u, 400u);
             }
         }
-        bool reserved = request == 0 && location == 0;
-        if (!reserved && args.mix.rows == 2 && row == 0 && (args.requests[0] == args.requests[1] || args.locations[0] == args.locations[1])) valid = false;
-        if (!valid) atomicCAS(args.mix.synchronization + 2, 0u, 400u);
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 400)) return;
     if (!run_mix(args.mix, 401)) return;
@@ -204,26 +219,70 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 408)) return;
     int wave = blockIdx.x * 4 + threadIdx.x / 64;
     int lane = threadIdx.x & 63;
-    for (int work = wave; work < args.mix.rows * QSABlocks; work += Blocks * 4) {
-        int row = work / QSABlocks;
-        int group = work % QSABlocks;
+    // Chunks of QSABlocks groups this launch actually needs: the longest row's groups, rounded up to
+    // a power of two. The buffers are sized for qsa_lists (the server context), but a short request
+    // on a long-context server must not pay for the sorts and merge barriers of empty chunks, and
+    // with one chunk the path below is the former single 1024-wide sort, bit for bit.
+    int lists = 1;
+    {
+        int longest = 0;
+        for (int row = 0; row < args.mix.rows; ++row) longest = max(longest, args.sequence_lengths[row] / 4);
+        while (lists < args.qsa_lists && lists * QSABlocks < longest) lists *= 2;
+    }
+    int rounds = 0;
+    while ((1 << rounds) < lists) ++rounds;
+    // Index scores: one wave per 4-token group, -INF past the row's length up to lists * QSABlocks
+    // (entries beyond that are left stale; captures and checks only read the row's groups).
+    int64_t score_stride = args.qsa_lists * QSABlocks;
+    int64_t score_width = int64_t(lists) * QSABlocks;
+    for (int64_t work = wave; work < args.mix.rows * score_width; work += Blocks * 4) {
+        int row = work / score_width;
+        int64_t group = work % score_width;
         float score = -INFINITY;
         if (group < args.sequence_lengths[row] / 4) {
             int slot = args.request_tokens[args.requests[row] * args.request_stride + group * 4] / 4;
             score = 0.0f;
             for (int head = 0; head < IndexHeads; ++head) {
                 float partial = 0.0f;
-                for (int column = lane; column < IndexDim; column += 64) partial += float(args.index_queries[(row * IndexHeads + head) * IndexDim + column]) * float(args.compressed_keys[slot * IndexDim + column]);
+                for (int column = lane; column < IndexDim; column += 64) partial += float(args.index_queries[(row * IndexHeads + head) * IndexDim + column]) * float(args.compressed_keys[int64_t(slot) * IndexDim + column]);
                 score += fmaxf(wave_sum(partial), 0.0f);
             }
         }
-        if (lane == 0) args.index_scores[row * QSABlocks + group] = score;
+        if (lane == 0) args.index_scores[row * score_stride + group] = score;
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 409)) return;
-    for (int row = blockIdx.x; row < args.mix.rows; row += Blocks) {
+    // Index top-k. Each block sorts one chunk of QSABlocks groups (score descending, index
+    // ascending: a total order). With one chunk (every row <= 4096 tokens) the sorting block writes
+    // `selected` itself, exactly as the former single 1024-wide sort, so short rows keep their
+    // barriers and results bit for bit. With more chunks each chunk's best QSATopK go to
+    // chunk_* and log2(lists) pairwise bitonic merges reduce them to one list; because the
+    // order is total, the merged top QSATopK equal one full sort of every group.
+    for (int64_t work = blockIdx.x; work < args.mix.rows * lists; work += Blocks) {
+        int row = work / lists;
+        int chunk = work % lists;
+        int length = args.sequence_lengths[row];
+        int groups = length / 4;
+        // <= QSATopK groups are selected in order without sorting.
+        if (groups <= QSATopK) {
+            if (lists == 1) {
+                for (int column = threadIdx.x; column < QSABudget; column += Threads)
+                    args.selected[row * QSABudget + column] = column < length ? column : -1;
+            }
+            continue;
+        }
+        int remaining = groups - chunk * QSABlocks;
+        int64_t list = (int64_t(row) * args.qsa_lists + chunk) * QSATopK;
+        if (remaining <= 0) {
+            // Chunk entirely past the length: filler list, ranks below every real group.
+            for (int column = threadIdx.x; column < QSATopK; column += Threads) {
+                args.chunk_scores[list + column] = -INFINITY;
+                args.chunk_indices[list + column] = 0x7fffffff;
+            }
+            continue;
+        }
         for (int column = threadIdx.x; column < QSABlocks; column += Threads) {
-            sort_scores[column] = args.index_scores[row * QSABlocks + column];
-            sort_indices[column] = column;
+            sort_scores[column] = column < remaining ? args.index_scores[row * score_stride + int64_t(chunk) * QSABlocks + column] : -INFINITY;
+            sort_indices[column] = column < remaining ? chunk * QSABlocks + column : 0x7fffffff;
         }
         __syncthreads();
         for (int width = 2; width <= QSABlocks; width *= 2) {
@@ -242,14 +301,92 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
                 __syncthreads();
             }
         }
-        int groups = min(args.sequence_lengths[row] / 4, 512);
-        for (int column = threadIdx.x; column < QSABudget; column += Threads) {
-            int token = -1;
-            if (column < groups * 4) token = args.sequence_lengths[row] / 4 <= 512 ? column : sort_indices[column / 4] * 4 + column % 4;
-            else if (column < groups * 4 + args.sequence_lengths[row] % 4) token = args.sequence_lengths[row] / 4 * 4 + column - groups * 4;
-            args.selected[row * QSABudget + column] = token;
+        if (lists == 1) {
+            int kept = min(groups, QSATopK);
+            for (int column = threadIdx.x; column < QSABudget; column += Threads) {
+                int token = -1;
+                if (column < kept * 4) token = sort_indices[column / 4] * 4 + column % 4;
+                else if (column < kept * 4 + length % 4) token = groups * 4 + column - kept * 4;
+                args.selected[row * QSABudget + column] = token;
+            }
+        } else {
+            for (int column = threadIdx.x; column < QSATopK; column += Threads) {
+                args.chunk_scores[list + column] = sort_scores[column];
+                args.chunk_indices[list + column] = sort_indices[column];
+            }
         }
         __syncthreads();
+    }
+    if (lists > 1) {
+        if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 416)) return;
+        for (int round = 0; round < rounds; ++round) {
+            const float* src_scores = round % 2 ? args.merge_scores : args.chunk_scores;
+            const int32_t* src_indices = round % 2 ? args.merge_indices : args.chunk_indices;
+            float* dst_scores = round % 2 ? args.chunk_scores : args.merge_scores;
+            int32_t* dst_indices = round % 2 ? args.chunk_indices : args.merge_indices;
+            int outputs = lists >> (round + 1);   // lists per row after this round
+            for (int64_t item = blockIdx.x; item < args.mix.rows * outputs; item += Blocks) {
+                int row = item / outputs;
+                int pair = item % outputs;
+                if (args.sequence_lengths[row] / 4 <= QSATopK) continue;
+                // List p of round r holds chunks [p * 2^r, (p + 1) * 2^r); in round r the source
+                // lists sit at stride lists >> r per row, compacted to the front.
+                int64_t row_base = int64_t(row) * args.qsa_lists * QSATopK;
+                int64_t left = row_base + int64_t(pair * 2) * QSATopK;
+                int64_t right = left + QSATopK;
+                int64_t target = row_base + int64_t(pair) * QSATopK;
+                bool right_empty = int64_t(pair * 2 + 1) * (1 << round) * QSABlocks >= args.sequence_lengths[row] / 4;
+                if (right_empty) {
+                    // Right half is all fillers, which rank below every entry on the left.
+                    for (int column = threadIdx.x; column < QSATopK; column += Threads) {
+                        dst_scores[target + column] = src_scores[left + column];
+                        dst_indices[target + column] = src_indices[left + column];
+                    }
+                    __syncthreads();
+                    continue;
+                }
+                // Left descending + right reversed is bitonic; one merge stage sorts it descending.
+                for (int column = threadIdx.x; column < QSATopK; column += Threads) {
+                    sort_scores[column] = src_scores[left + column];
+                    sort_indices[column] = src_indices[left + column];
+                    sort_scores[QSABlocks - 1 - column] = src_scores[right + column];
+                    sort_indices[QSABlocks - 1 - column] = src_indices[right + column];
+                }
+                __syncthreads();
+                for (int distance = QSABlocks / 2; distance > 0; distance /= 2) {
+                    for (int column = threadIdx.x; column < QSABlocks; column += Threads) {
+                        int partner = column ^ distance;
+                        if (partner > column) {
+                            bool greater = sort_scores[partner] > sort_scores[column] || (sort_scores[partner] == sort_scores[column] && sort_indices[partner] < sort_indices[column]);
+                            if (greater) {
+                                float score = sort_scores[column]; sort_scores[column] = sort_scores[partner]; sort_scores[partner] = score;
+                                int index = sort_indices[column]; sort_indices[column] = sort_indices[partner]; sort_indices[partner] = index;
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
+                for (int column = threadIdx.x; column < QSATopK; column += Threads) {
+                    dst_scores[target + column] = sort_scores[column];
+                    dst_indices[target + column] = sort_indices[column];
+                }
+                __syncthreads();
+            }
+            if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 417)) return;
+        }
+        const int32_t* merged = rounds % 2 ? args.merge_indices : args.chunk_indices;
+        for (int row = blockIdx.x; row < args.mix.rows; row += Blocks) {
+            int length = args.sequence_lengths[row];
+            int groups = length / 4;
+            int kept = min(groups, QSATopK);
+            const int32_t* final_indices = merged + int64_t(row) * args.qsa_lists * QSATopK;
+            for (int column = threadIdx.x; column < QSABudget; column += Threads) {
+                int token = -1;
+                if (column < kept * 4) token = groups <= QSATopK ? column : final_indices[column / 4] * 4 + column % 4;
+                else if (column < kept * 4 + length % 4) token = groups * 4 + column - kept * 4;
+                args.selected[row * QSABudget + column] = token;
+            }
+        }
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 410)) return;
     for (int work = wave; work < args.mix.rows * QSAHeads * QSABudget; work += Blocks * 4) {
@@ -339,7 +476,10 @@ extern "C" int flash_qsa_info(int64_t* result) {
 }
 
 extern "C" int flash_qsa(QSAArguments* args, void* stream) {
-    if (args->mix.rows < 1 || args->mix.rows > MaxRows || (args->position_axes != 1 && args->position_axes != 3) || args->request_stride < QSAContext) return hipErrorInvalidValue;
+    if (args->mix.rows < 1 || args->mix.rows > MaxRows || (args->position_axes != 1 && args->position_axes != 3)) return hipErrorInvalidValue;
+    int64_t lists = args->qsa_lists;
+    if (lists < 1 || lists > QSAChunkLists || (lists & (lists - 1)) != 0) return hipErrorInvalidValue;
+    if (args->context_limit < 1 || args->context_limit > lists * QSABlocks * 4 || args->request_stride < args->context_limit) return hipErrorInvalidValue;
     void* arguments[] = {args};
     return launch_cooperative(reinterpret_cast<const void*>(qsa_attention), arguments, stream);
 }

@@ -8,7 +8,7 @@ import torch
 
 from .program import FlashContractError, HCMix, PeerGroup, PostAttention
 from .gdn import GDNAttention
-from .qsa import QSAAttention
+from .qsa import QSAAttention, cache_views
 from .ple import PLE
 from .decode_io import DecodeIO
 
@@ -85,13 +85,15 @@ class FlashRuntime:
         self.validated_batch_sizes = set()
         if self.model.start_layer != 0 or self.model.end_layer != 48 or len(self.model.layers) != 48:
             raise FlashContractError("Flash-Next runtime requires all 48 target layers")
+        # Sizes the QSA index top-k (one 4096-token sort chunk per power-of-two list).
+        self.context_length = int(getattr(runner.server_args, "context_length", None) or runner.model_config.context_len)
         for layer in self.model.layers:
             hc = layer.attn_hyper_connection
             self.mixers.append(HCMix(hc.hc_norm.weight, hc.input_mix_weight_down.weight, hc.input_mix_weight_up.weight))
             self.mixers[-1].state = self.peers.state
             self.posts.append(PostAttention(layer, self.peers))
             self.gdn.append(GDNAttention(layer.linear_attn, self.mixers[-1]) if hasattr(layer, "linear_attn") else None)
-            self.qsa.append(QSAAttention(layer, self.mixers[-1]) if hasattr(layer, "indexer") else None)
+            self.qsa.append(QSAAttention(layer, self.mixers[-1], self.context_length) if hasattr(layer, "indexer") else None)
             self.ple.append(PLE(layer.ple, self.peers) if layer.ple is not None else None)
         hc = self.model.hyper_connection_mixer
         self.tail = HCMix(hc.hc_norm.weight, hc.input_mix_weight_down.weight, hc.input_mix_weight_up.weight)
@@ -409,9 +411,15 @@ class FlashRuntime:
                     checks = {"output": error_metrics(attention, reference_attention)}
                     for name, tensor, actual in zip(("key", "value", "ring", "ring_positions", "compressed"), cache_tensors, actual_cache):
                         checks[name] = error_metrics(actual[1:], tensor[1:]) if name == "compressed" else error_metrics(actual, tensor)
+                    # Whole-buffer metrics dilute one wrong row over the pool (a fully wrong compressed
+                    # row at context 200k is nrmse ~0.006, under the gate), so also compare exactly the
+                    # rows this step wrote. Compressed keys only decide the index top-k above 512 groups,
+                    # so a wrong decode-time write is invisible at short context.
+                    checks.update(self._qsa_written_checks(batch, backend, cache_tensors, actual_cache))
+                    for tensor, actual in zip(cache_tensors, actual_cache):
                         tensor.copy_(actual)
                     self.shadow_checks.append({"kind": "qsa", "layer": layer_id, "checks": checks})
-                    failed = any(not check["finite"] or check["nrmse"] > 0.008 for check in checks.values())
+                    failed = any(not check["finite"] or check["nrmse"] > 0.008 or check.get("count", 0) or check.get("read_slot_matches") is False for check in checks.values())
                     capture_layers = {int(value) for value in os.environ.get("SGLANG_AMD_FLASH_CAPTURE_QSA_LAYERS", "47").split(",")}
                     capture = self.rank == 2 and layer_id in capture_layers and self.completed_decode_steps == int(os.environ.get("SGLANG_AMD_FLASH_CAPTURE_QSA_STEP", "-1"))
                     if capture or (failed and ("qsa", layer_id) not in self.failure_captures):
@@ -445,6 +453,45 @@ class FlashRuntime:
         if not self.shadow_record_failures:
             raise FlashContractError(message)
         logger.error("AMD_FLASH_CORRECTNESS_DIAGNOSTIC %s", message)
+
+    @staticmethod
+    def _qsa_written_checks(batch, backend, expected_cache, actual_cache):
+        lengths = batch.seq_lens.long()
+        requests = batch.req_pool_indices.long()
+        locations = batch.out_cache_loc.long()
+        key, value, ring, ring_positions, compressed = expected_cache
+        actual_key, actual_value, actual_ring, actual_ring_positions, actual_compressed = actual_cache
+        (key, value), (actual_key, actual_value) = cache_views(key, value), cache_views(actual_key, actual_value)
+        pages, offsets = locations // 64, locations % 64
+        ring_rows = requests * 4 + (lengths - 1) % 4
+        checks = {
+            "written_key": error_metrics(actual_key[pages, offsets], key[pages, offsets]),
+            "written_value": error_metrics(actual_value[pages, offsets], value[pages, offsets]),
+            "written_ring": error_metrics(actual_ring[ring_rows], ring[ring_rows]),
+            "written_ring_positions": error_metrics(actual_ring_positions[ring_rows], ring_positions[ring_rows]),
+        }
+        completed = lengths % 4 == 0
+        if bool(completed.any()):
+            rows = locations[completed] // 4
+            checks["written_compressed"] = error_metrics(actual_compressed[rows], compressed[rows])
+            # Index scores read the group's key at its first token's slot; both must name one row.
+            table = backend.req_to_token_pool.req_to_token
+            first = table[requests[completed], lengths[completed] - 4].long() // 4
+            checks["written_compressed"]["read_slot_matches"] = bool(torch.equal(first, rows))
+        # Anything the step wrote outside these rows (e.g. a compressed key at the wrong slot).
+        for name, expected, actual, written in (("key", key, actual_key, None), ("compressed", compressed, actual_compressed, (locations[completed] // 4) if bool(completed.any()) else None)):
+            if name == "key":
+                mask = torch.ones(expected.shape[:2], dtype=torch.bool, device=expected.device)
+                mask[pages, offsets] = False
+                differs = (expected.view(torch.int16) != actual.view(torch.int16)).flatten(2).any(-1) & mask
+            else:
+                mask = torch.ones(expected.shape[0], dtype=torch.bool, device=expected.device)
+                mask[0] = False
+                if written is not None:
+                    mask[written] = False
+                differs = (expected.view(torch.int16) != actual.view(torch.int16)).flatten(1).any(-1) & mask
+            checks[f"unwritten_{name}_rows_changed"] = {"finite": True, "nrmse": 0.0, "count": int(differs.sum())}
+        return checks
 
     def _capture_qsa(self, layer_id, layer, hidden, positions, batch, backend, before, actual_cache, attention, native_mixed, native_output, checks):
         kernel = self.qsa[layer_id]

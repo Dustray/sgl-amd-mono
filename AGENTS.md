@@ -32,7 +32,7 @@ upstream gfx950 models are out of scope unless the user asks.
 | Path | What |
 |---|---|
 | `bench_flash_next.py` | **The** benchmark entry: launches/attaches a server, measures TTFT/TPOT/E2E/prefill/throughput, optional torch profile |
-| `launch_qwen_flash_next.sh` | Native BF16 server, base flags for every Flash-Next run (BF16 KV, Triton attn/MoE, page 64, ctx 4096, chunked prefill 256, overlap/radix off) |
+| `launch_qwen_flash_next.sh` | Native BF16 server, base flags for every Flash-Next run (BF16 KV, Triton attn/MoE, page 64, ctx 4096, chunked prefill 256, overlap/radix off); `bench_flash_next.py --context-length` appends an override |
 | `launch_qwen_flash_next_monokernel.sh` | Same + `SGLANG_AMD_FLASH_NEXT_0518=1` (mono decode) |
 | `launch_qwen_flash_next_monokernel_graph.sh` | Mono + decode graph for batch 1/2 |
 | `sgl_amd_mono/qwen38_flash_next/gfx936/` | Mono implementation: HIP C++ kernels (`kernel.cpp`, `gdn.cpp`, `qsa.cpp`, `ple.cpp`, `decode_io.cpp`), `runner.py` (runtime, shadow checks), `graph.py` (decode-graph capture/replay checks), `program.py` (hipcc build, cached by source hash under `$SGLANG_AMD_FLASH_REPORT_DIR/codegen`), `contract.py` (startup config checks), `native_sources.json` (pinned SGLang interface hashes) |
@@ -75,13 +75,50 @@ Metric definitions used by the script (keep them when comparing to old data):
 
 ## Mono constraints (enforced by `contract.py` / `graph.py`)
 
-- BF16 weights and KV, Triton attention + MoE, page 64, context ≤ 4096, decode batch 1 or 2,
+- BF16 weights and KV, Triton attention + MoE, page 64, context ≤ 262144, decode batch 1 or 2,
   overlap schedule and radix cache off, PLE embedding on GPU. Prefill always runs native SGLang.
+- **Long context (2026-11-17).** The QSA index top-k was one 1024-wide bitonic sort, which capped the
+  context at 4096. It now sorts the 4-token groups in chunks of 1024 (one block per chunk) and merges
+  the per-chunk best-512 lists pairwise, `log2(chunks)` rounds, barriers 416/417. The comparator is a
+  total order (score descending, index ascending), so the merged top 512 equal one full sort of every
+  group; `tools/verify_flash_next_qsa.py` checks exactly that (`selected_exact_topk`) rather than
+  native's tie order. Cap is `QSAChunkLists = 64` chunks → `contract.QSA_CONTEXT_CAP = 262144`.
+  The chunk count is chosen **on the device from the longest row of the launch**, not from the server
+  context, so a short request on a long-context server costs no extra sorts or merge barriers and, at
+  one chunk, runs the former single-sort code bit for bit. That also makes it correct under decode-graph
+  replay, where the sequence grows between replays of one captured graph (`grid_sync` is epoch-based, so
+  a per-launch barrier count is fine as long as every block agrees — they all read the same lengths).
+  Buffers are still sized for the server context (`qsa_lists(context_length)` in `qsa.py`, ~1.5 MiB per
+  QSA layer per rank at the cap). `index_scores` entries past the chunks a launch uses are left stale.
+- **Above 512 groups the kept set may differ from native, and that is not a kernel bug.** Both sides build
+  the index scores in BF16, so `index_queries` differ by ~5e-4 nrmse and scores by up to 6e-2, while at a few
+  thousand groups the 512th and 513th scores can sit 1e-3 apart. Measured on `[4099, 16383]`: mono kept group
+  1864, native kept 3983, whose native scores differ by 1.6e-3 — 40x below the score noise. So
+  `verify_flash_next_qsa.py` now (a) always checks the kernel's selection *is* the exact top-512 of its own
+  scores (`selected_exact_topk`, a total order, independent of native), (b) compares the selected set with
+  native only when native's own 511/512 gap exceeds twice the score noise (`selection_unambiguous`), and
+  (c) when the sets do differ at a tied cutoff, re-runs the reference on the kernel's own token list
+  (`native(..., selection=...)`) so the arithmetic is still checked strictly — that moved this layer's output
+  from nrmse 0.062 to 0.0015, i.e. the 6% was entirely the tie choice, not the math. Only 1 of 24 long-context
+  checks needed (c); at context 4096 all 192 checks still match native's set exactly.
+- Module verification runs (2026-11-17, layer 3 rank 0 unless noted, eager + graph replay, real weights):
+  `--context 4096` (all layers/ranks, 192 checks), `--context 16384 --lengths 4097 16381`,
+  `--context 262144 --lengths 65533 262141` — all pass. Lengths now go per row, so batch 2 covers two
+  *different* lengths (`[63, 16381]`, `[16381, 63]`): the short row only reaches the multi-chunk branch when
+  a longer row in the same wave pushes the chunk count above 1, which nothing tested before.
 - Decode graph: `--cuda-graph-backend-decode full`, capture only bs ⊆ {1,2}, `--disable-cuda-graph-padding`,
   and `HIP_GRAPH_ACCUMULATE_DISPATCH=0` **before HIP init** (also required by the plugin for native+graph).
 - Each decode step = 99 fused launches per rank (1 entry, 36 GDN, 12 QSA, 48 post-attention, 1 PLE, 1 tail).
   `/server_info` → `internal_states[*].amd_flash_next_monokernel` has `completed_decode_steps`, `executions`, `acceptance_status`.
 - Always set `SGLANG_USE_FUSED_TOPK_SOFTMAX=0`: the LightOp fused top-k selects wrong experts on real routing inputs.
+- **Startup weight validation flakes (2026-11-17).** `_validate_weights` can fail at a random layer with
+  `reduced_moe` nrmse ~0.2 while `max_absolute_error` is ~0.003, killing every TP scheduler before the server
+  is ready (exit -9). Seen at layer 18 rows=2; the same build passed on relaunch. It is the known router tie:
+  the dump showed fused vs. native `mixed` differing by 3e-7 relative, `moe_same_input` at nrmse 5e-5, but
+  `reduced_moe` (native MoE on *native's* mixed) 23% off — only a flipped expert does that, and native HC mix
+  uses FP32 atomic split-K, so it is not reproducible. The layer output itself was fine (nrmse 0.0015).
+  Just relaunch; do not relax the 0.02 threshold. Dumps land in `$SGLANG_AMD_FLASH_REPORT_DIR/failed-layer-*.pt`
+  (only the ranks that finish writing before SIGQUIT are non-empty).
 - Host memory: each rank stages ~45 GiB on the host while loading. Other users' jobs sometimes hold >100 GiB on
   NUMA node 0 (`/sys/devices/system/node/node0/meminfo`), so binding rank 0 to node 0 gets it OOM-killed (exit -9
   at "Multi-thread loading shards 0/131"). `bench_flash_next.py` does not bind by default (`--numa off|auto|on`).
@@ -228,7 +265,7 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --outp
 - Not embedded in the torch-profiler merged trace (`inference.perfetto.json.gz`) — the per-CU rows
   are a separate Perfetto file. Unit tests: `test/unit/test_flash_next_cu_timing.py`.
 
-## Status (2026-11-10)
+## Status (2026-11-17)
 
 - Mono decode runs end to end, with and without decode graph. Graph vs. eager mono is bit-identical
   on the first real request (logits and all 48 layers' caches) on all ranks.
@@ -242,40 +279,26 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --outp
   `SGLANG_AMD_FLASH_ACCURACY_REFERENCE=1` installs a deterministic reference (fixed HC sum order, stable QSA ties);
   even then b1 2048/3072→64 have 6/63 non-reproducible reference steps. Do not relax thresholds; do not call
   perf numbers "accepted". Raw evidence: `monokernel_reports/flash_next_tp8/` (`precision_*`, `accuracy_*`, `serving_complete_v5`).
-- Mono decode ≈ 90 ms/token (b1, ctx 512); graph saves only ~5% because launch overhead is small at 99 launches.
-  The kernels themselves are the bottleneck: native BF16 + decode graph (same Triton/BF16-KV config) runs at
-  TPOT ≈ 45–49 ms across the whole matrix, so mono + graph is 1.1–1.9× slower end to end at b1 and 1.2–2.1× at b2.
-  Full 20-case native+graph data: `bench_results/20261110_native_graph_{grid,16-1024,b2_2048_rerun}/`.
-- Latest numbers and how they were measured: `Flash-Next 性能对比.md`.
-
-## HC mix.down split-K (2026-11-16)
-
-`run_mix` (`kernel.cpp`, used by hc_mix, post, gdn, qsa, tail) used to run mix.down (10240→320) as a plain
-`gemv`: rows × 20 tiles = 20 waves = blocks 0-4 each walking all 640 K steps, 75 blocks parked in the barrier
-(that is why a few CUs looked very long in the per-CU trace). Now `mix_down_partials` splits it into
-tile × 256-column chunk tasks (800 at b1, every wave busy, loads issued before the MMACs) writing FP32 partials
-to `partials [2, 40, 320]` (new `MixArguments`/`PostArguments` field, after `gates`), and after the barrier every
-block sums the 40 chunks in order into LDS (`mix_down_reduce`) and feeds mix.up from there. Sum order equals
-`matvec16(split_k=256)`, so results are **bit-identical** to before (72/72 tensors: output, lowrank, gates, 4 layers,
-b1/b2). Standalone `hc_mix`: 340-360 → 91 us (b1), 111 us (b2). Passing: `verify_flash_next_{hc,gdn,qsa,io,moe}`.
-
-## Pitfalls already hit
-
-- **Comparing against the wrong native baseline.** `monokernel_reports/flash_next_tp8/native_graph_no_spec_20261109_151454/native_graph_detailed`
-  is native with **FP8 KV + FA3 + AITER MoE, overlap/radix on** — not the mono configuration. Only compare
-  mono against native runs with BF16 KV + Triton (check `server_info.json`).
-- Decode-graph capture feeds dummy rows on SGLang's reserved request slot 0 and KV slot 0 (both rows of a bs=2
-  capture share them). Kernel input validation must accept that reserved slot (fixed in `ple.cpp` stage 500
-  and `qsa.cpp` stage 400); a failure shows as `Flash-Next device synchronization failed at stage N`.
-- Under graph replay `model.forward` is not called: profile step markers come from the wrapped
-  `DecodeCudaGraphRunner.execute`, and per-layer `module/...` CPU ranges do not exist for decode.
-- PyTorch profiler copies `record_function` ranges onto the GPU timeline (`gpu_user_annotation`) for graph
-  replays. Count phases only from `cat == "user_annotation"`.
-- `--max-total-tokens` must be ~`batch * context`, not `batch * (input + output)`: with an exact budget the
-  scheduler serializes a batch-2 wave (second request starts only after the first finishes), which silently
-  inflates TTFT/TPOT. `bench_flash_next.py` now requests `batch * 4096` and warns when a wave was serialized.
-- `/proc` paths like `/root/code/playground-cwdN/...` in tracebacks are the same files as in this repo.
-- `pytest test/unit` has ~20 collection errors from other models' gfx950-only imports; run the Flash-Next
-  files directly: `test/unit/test_qwen38_flash_next_{gfx936,graph,layout}.py test/unit/test_profile_trace.py test/unit/test_sglang0518_compat.py`
-  (91 pass, 5 skip on 2026-11-10). `test_qwen38_flash_next_spec.py` is the upstream gfx950 spec and needs a newer SGLang.
-- Kernel binaries are cached by source hash; editing a `.cpp` triggers a rebuild on next server start.
+- **Long-context mono output degrades (11-17, open).** Users see garbled tags then an early stop on long prompts, mono
+  only. Prime suspect: the decode-time compressed index key write (`qsa.cpp` stage 406-408). It is irrelevant at <= 512
+  groups (every group is kept) and was only checked against our own `QSAAttention.native()` plus whole-buffer shadow
+  nrmse, which dilutes one wrong row below the gate (one row of ~50k at 200k context is ~0.006). The QSA shadow now also
+  reports `written_{key,value,ring,ring_positions,compressed}` on exactly the rows the step wrote,
+  `read_slot_matches` (the slot index scores read == the slot the write used) and `unwritten_{key,compressed}_rows_changed`
+  (bitwise stray writes); any of them fails the check. Compressed keys are written only when `seq_len % 4 == 0`, so run
+  with `SGLANG_AMD_FLASH_SHADOW_STEPS>=4` (plus `_SHADOW_RECORD_FAILURES=1`) on a > 2048-token prompt.
+- **Long context works end to end (11-17).** Mono runs on a 128000-token server: b1 eager TPOT 33.03 ms at
+  512 input, 43.68 at 8192, 44.16 at 32768; +graph 40.10 at 32768. Native on the same 128k server is
+  460–583 ms per token at every input length, because native decode scales with the *allocated* context while
+  mono scales with the sequence (mono's 512-token TPOT on a 128k server equals its 4096-server number).
+  Prefill is unchanged — it is always native. Accuracy: the one shadow step each run does passed its gate
+  (8192: KL 0.00192 / TV 0.0305; 32768 + graph: KL 0.00017 / TV 0.00194, argmax equal, 99 module checks at
+  nrmse 0), and 32768 graph replay is bit-identical to eager. That is **not** the full accuracy acceptance
+  described above, which still fails and has not been run at long context. Data in
+  `bench_results/20261117_mono_longctx_{ctx128k,graph_32768,8192-16_r2}`.
+- Mono decode perf (11-16/17, operators #1–#10 in the doc): b1 512→64 eager TPOT 32.92 ms, +graph 29.17 ms
+  vs native+graph 45.5 ms — mono is now ~28%/36% faster per token eager/graphed. Was 94.7/90.1 ms before
+  #1–#10. Bit-exactness verified only for #1; #2–#10 pending. The full b1/b2 matrices in the doc are still
+  pre-optimization (11-09/11-10) and need a rerun; latest runs:
+  `bench_results/20261111_monokernel_eager_b1_512-64-12362` (eager) / `…-12348` (graph).
+- Full 20-case native+graph data: `bench_results/20261110_native_graph_{grid,16-1024,b2_2048_rerun}/`.

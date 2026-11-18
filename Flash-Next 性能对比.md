@@ -29,7 +29,7 @@ Monokernel 支持的模型中，唯一一个 Qwen 模型是 Qwen3.8-Flash-Next�
 
 ## 测试配置
 
-四种模式除了下表列出的差异，其余服务配置完全相同：BF16 KV、Triton attention / MoE、page 64、context 4096、chunked prefill 256、关闭 overlap 和 radix cache、关闭 MTP。
+四种模式除了下表列出的差异，其余服务配置完全相同：BF16 KV、Triton attention / MoE、page 64、context 4096、chunked prefill 256、关闭 overlap 和 radix cache、关闭 MTP。长上下文的数据（见下面“长上下文”一节）用 `--context-length` 覆盖 context，其余不变。
 
 | 模式 | decode 路径 | decode Graph |
 |---|---|---|
@@ -67,6 +67,62 @@ Monokernel 支持的模型中，唯一一个 Qwen 模型是 Qwen3.8-Flash-Next�
 | | 3 | 576.1 | 28.97 | 2.401 | 34.52 |
 
 不开 Graph 的第 2、3 轮四个指标完全相同，疑似记录重复，建议重跑确认。数据在 `bench_results/20261111_monokernel_eager_b1_512-64-12362`（不开 Graph）、`…-12348`（开 Graph）；#1–#9 的数据在 `…-1234`。#2–#10 的逐位一致还没验证，这些数字只代表性能。
+
+## 长上下文（11-17）
+
+Mono 原来的 context 上限是 4096：QSA 的 index top-k 是一次 1024 宽的 bitonic 排序，一个 block 排完
+全部 4 token 分组。现在改成按 1024 组一块分块排序，再把每块的前 512 名两两归并（`log2(块数)` 轮，
+barrier 416/417），上限变成 64 块 = **262144**。比较器是全序（分数降序、下标升序），所以归并出来的
+前 512 名和把所有分组做一次完整排序的结果相同。
+
+关键一点：**块数是在设备端按这一次 launch 里最长的那一行算的，不是按服务的 context 算的**。所以在一台
+128k context 的服务上发一个 512 token 的请求，不会多排一次序、也不会多走一轮归并 barrier；块数为 1 时
+走的就是原来那段单次排序的代码，逐位一致。
+
+### 性能（batch 1，output 16，context 128000）
+
+| 模式 | in→out | TTFT ms | TPOT ms | decode tok/s |
+|---|---:|---:|---:|---:|
+| Mono 不开 Graph | 512→16 | 316.27 | **33.03** | 30.28 |
+| Mono 不开 Graph | 8192→16 | 1311.38 | **43.68** | 22.90 |
+| Mono 不开 Graph | 32768→16 | 5274.27 | **44.16** | 22.64 |
+| Mono 开 Graph | 32768→16 | 5342.21 | **40.10** | 24.94 |
+| 原生不开 Graph（output 64） | 512→64 | 713.51 | 583.21 | 1.72 |
+| 原生不开 Graph（output 64） | 8192→64 | 1582.93 | 550.18 | 1.82 |
+| 原生不开 Graph（output 64） | 32768→64 | 5229.34 | 459.52 | 2.18 |
+
+同样 128k 的服务上，mono 每 token 比原生快 10–18 倍（512 约 17.7×，8192 约 12.6×，32768 约 10.4×，
+开 Graph 11.5×）。原因不是 mono 变快了，而是**原生的 decode 成本跟着分配的 context 走**：原生在 4096
+context 上 TPOT 是 45.5 ms，换到 128k context 就变成 460–583 ms，而且 512 和 32768 的输入几乎一样慢。
+Mono 跟着实际序列长度走——512 token 在 128k 服务上是 33.03 ms，和它在 4096 服务上的 32.92 ms 基本相同。
+
+TTFT 和 prefill 两边接近，因为 **prefill 一直都是原生 SGLang 跑的**，mono 只接管 decode。
+
+注意原生那三行是 output 64、mono 是 output 16（TPOT 是每 token 的，可比；但原生的均值摊在 63 个 token 上，
+mono 摊在 15 个上）。数据：`bench_results/20261117_mono_longctx_ctx128k`、`…_graph_32768`、
+`…_8192-16_r2`（context 16384，8192→16，TPOT 43.36），原生是 `bench_results/20261117_native_eager_ctx128k`。
+
+### 精度
+
+- 算子级（`tools/verify_flash_next_qsa.py`，真实权重、单卡、eager 和 graph replay）：context 4096 /
+  16384 / 262144 都通过，长度覆盖到 262141。新加的 `selected_exact_topk` 用自己的精确 top-512 做基准
+  （而不是原生那个在 tie 上不确定的顺序），要求逐位相同。context 4096 的结果和改之前逐位一致。
+- 也加了**两行长度不同**的 batch 2 用例（如 `[63, 16381]` 和 `[16381, 63]`）：短的那一行只有在同一
+  批里有更长的行把块数顶到大于 1 时，才会走到那条分支，之前从没测过。
+- **分组数超过 512 之后，选中的集合可能和原生不一样，这不是 kernel 的 bug。** 两边的 index score 都是
+  BF16 算的，`index_queries` 差约 5e-4 nrmse、分数差最大 6e-2；而分组数到几千时，第 512 名和第 513 名
+  可能只差 1e-3。实测 `[4099, 16383]`：mono 选了 1864 组、原生选了 3983 组，这两组在原生分数里只差
+  1.6e-3，比噪声小 40 倍。所以验证脚本改成：① 始终检查 kernel 选的就是它自己分数的精确前 512 名
+  （全序，不依赖原生）；② 只有当原生自己的 511/512 间隔大于两倍噪声时才比对集合；③ 集合真的不同时，
+  用 kernel 选的 token 列表重跑参考（`native(..., selection=...)`），这样算术仍然严格检查——这一项把该层
+  输出的 nrmse 从 0.062 降到 0.0015，说明那 6% 完全来自 tie 的选择而不是计算。长上下文 24 个检查里只有
+  1 个走到 ③；context 4096 的 192 个检查仍然和原生集合完全一致。
+- 服务级 shadow check：8192（context 16384）KL 0.00192 / TV 0.0305、32768（context 128000，开 Graph）
+  KL 0.00017 / TV 0.00194，argmax 都相同，99 个算子级检查全部 nrmse 0（最大 0.004），都通过门限。
+- 开 Graph 时，32768 的 graph replay 与 eager **逐位相同**（logits nrmse 0，123 个状态张量全等）。
+
+这些只是每次运行里的**单个** shadow step 通过了门限，不等于 AGENTS.md 里那套完整精度验收——那套
+（多长度 × 多步）目前仍然不通过，长上下文下也还没跑过。
 
 ## batch 1, 512→64，四种模式（优化前基线，11-09 / 11-10）
 
@@ -178,7 +234,7 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --kernel-stages \
 
 完整 trace 输出在 `<运行目录>/monokernel/inference.perfetto.json.gz`。工具会跳过预热，只对正式请求的每个 decode step 记录核内阶段；trace 采集会有额外开销，不用于性能验收。
 
-结果默认写到 `bench_results/<时间>_<模式>_<graph|eager>/`。其中 `summary.md` / `summary.csv` 是汇总表，`results.json` 记录每个 token 的到达时间和服务配置，`profile/` 里是 trace。Mono 只支持 batch 1 和 2，输入加输出不能超过 4096。
+结果默认写到 `bench_results/<时间>_<模式>_<graph|eager>/`。其中 `summary.md` / `summary.csv` 是汇总表，`results.json` 记录每个 token 的到达时间和服务配置，`profile/` 里是 trace。Mono 只支持 batch 1 和 2；context 默认 4096，用 `--context-length` 可以加到 262144（输入加输出不能超过 context）。
 
 已有的 Perfetto trace（batch 1，512→64）在 `profiles/` 下：原生、原生 + Graph、Mono 各一份，用 Perfetto UI 的 Open trace file 打开。这三份是 torch profiler 采的，带模型分层标记。
 

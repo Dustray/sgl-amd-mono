@@ -39,6 +39,8 @@ from sgl_amd_mono.common.gpus import check_gpus_idle, gpu_usage
 ROOT = Path(__file__).resolve().parent
 MODEL = "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-Flash-Next/snapshots/master"
 CONTEXT = 4096
+# Mono's own limit: the QSA index top-k merges at most 64 sort chunks (contract.QSA_CONTEXT_CAP).
+MONO_CONTEXT_CAP = 64 * 4096
 PAGE = 64
 MONO_BATCH_SIZES = (1, 2)
 NUMA_MIN_FREE_GIB = 60
@@ -106,9 +108,10 @@ def server_command(arguments):
     batch = max(arguments.batch_size)
     # A full context per request: an exact batch * (input + output) budget leaves no room for page rounding and
     # reserved slots, and the scheduler then serializes the requests of a wave.
-    total_tokens = batch * CONTEXT
+    total_tokens = batch * arguments.context_length
     command = ["bash", str(ROOT / "launch_qwen_flash_next.sh"),
                "--port", str(arguments.port), "--random-seed", str(arguments.seed),
+               "--context-length", str(arguments.context_length),
                "--max-running-requests", str(batch), "--max-total-tokens", str(total_tokens),
                "--max-mamba-cache-size", str(max(4, 4 * batch)), "--kv-cache-dtype", "bfloat16",
                "--enable-metrics", "--enable-cache-report", "--stream-interval", "1", "--watchdog-timeout", "1200"]
@@ -389,6 +392,7 @@ def parse_arguments():
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1], help="concurrent requests per wave (mono supports 1 and 2)")
     parser.add_argument("--input-len", type=int, nargs="+", default=[512], help="prompt tokens per request")
     parser.add_argument("--output-len", type=int, nargs="+", default=[64], help="generated tokens per request (ignore_eos)")
+    parser.add_argument("--context-length", type=int, default=CONTEXT, help=f"server context length per request (default {CONTEXT}; mono supports at most {MONO_CONTEXT_CAP})")
     parser.add_argument("--repeats", type=int, default=3, help="timed waves per case")
     parser.add_argument("--warmups", type=int, default=1, help="untimed waves per case before timing")
     parser.add_argument("--seed", type=int, default=42, help="seed for the random prompt token ids and the server")
@@ -410,8 +414,12 @@ def parse_arguments():
         parser.error("mono decode supports batch sizes 1 and 2")
     if min(arguments.batch_size) < 1 or min(arguments.input_len) < 1 or min(arguments.output_len) < 2:
         parser.error("batch >= 1, input >= 1 and output >= 2 are required")
-    if max(arguments.input_len) + max(arguments.output_len) > CONTEXT:
-        parser.error(f"input + output must fit the {CONTEXT}-token context")
+    if arguments.context_length < 1:
+        parser.error("--context-length must be >= 1")
+    if arguments.mode == "mono" and arguments.context_length > MONO_CONTEXT_CAP:
+        parser.error(f"mono decode supports a context of at most {MONO_CONTEXT_CAP} tokens")
+    if max(arguments.input_len) + max(arguments.output_len) > arguments.context_length:
+        parser.error(f"input + output must fit the {arguments.context_length}-token context")
     if arguments.repeats < 1 or arguments.warmups < 1:
         parser.error("--repeats and --warmups must be >= 1 (the first wave per batch size runs the mono shadow check)")
     if arguments.url and arguments.server_args:

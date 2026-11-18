@@ -13,9 +13,9 @@ from .program import FlashContractError, HIPProgram, MixArguments, require_tenso
 
 class QSAArguments(ctypes.Structure):
     _fields_ = [("mix", MixArguments)] + [(name, ctypes.c_void_p) for name in (
-        "qkv_weight", "q_norm", "k_norm", "output_weight", "index_weight", "index_q_norm", "index_k_norm", "rotary_cache", "positions", "sequence_lengths", "requests", "locations", "request_tokens", "key_cache", "value_cache", "index_ring", "ring_positions", "compressed_keys", "projected", "index_projected", "queries", "index_queries", "index_scores", "selected", "attention_scores", "core", "output", "executions",
+        "qkv_weight", "q_norm", "k_norm", "output_weight", "index_weight", "index_q_norm", "index_k_norm", "rotary_cache", "positions", "sequence_lengths", "requests", "locations", "request_tokens", "key_cache", "value_cache", "index_ring", "ring_positions", "compressed_keys", "projected", "index_projected", "queries", "index_queries", "index_scores", "selected", "chunk_scores", "chunk_indices", "merge_scores", "merge_indices", "attention_scores", "core", "output", "executions",
     )] + [(name, ctypes.c_int64) for name in (
-        "request_stride", "request_count", "cache_slots", "ring_slots", "rotary_rows", "position_axes", "position_axis_stride", "key_page_stride", "key_token_stride", "key_dim_stride", "value_page_stride", "value_token_stride", "value_dim_stride",
+        "request_stride", "request_count", "cache_slots", "ring_slots", "rotary_rows", "position_axes", "position_axis_stride", "key_page_stride", "key_token_stride", "key_dim_stride", "value_page_stride", "value_token_stride", "value_dim_stride", "qsa_lists", "context_limit",
     )]
 
 
@@ -78,8 +78,24 @@ def cache_views(key, value):
     raise FlashContractError("Unsupported QSA KV layout")
 
 
+QSAChunkTokens = 4096   # tokens per index sort chunk (QSABlocks groups of 4 in qsa.cpp)
+QSAChunkLists = 64      # qsa.cpp QSAChunkLists
+QSATopK = 512
+
+
+def qsa_lists(context_length):
+    """Chunks the index top-k needs for `context_length`, rounded up to a power of two."""
+    context_length = int(context_length)
+    if not 1 <= context_length <= QSAChunkTokens * QSAChunkLists:
+        raise FlashContractError(f"QSA supports context 1..{QSAChunkTokens * QSAChunkLists}, got {context_length}")
+    lists = 1
+    while lists * QSAChunkTokens < context_length:
+        lists *= 2
+    return lists
+
+
 class QSAAttention:
-    def __init__(self, layer, mixer):
+    def __init__(self, layer, mixer, context_length=4096):
         self.mixer = mixer
         self.device = mixer.device
         self.program = QSAProgram.get(self.device)
@@ -95,7 +111,14 @@ class QSAAttention:
         self.index_projected = torch.empty((2, 640), dtype=torch.bfloat16, device=self.device)
         self.queries = torch.empty((2, 3, 256), dtype=torch.bfloat16, device=self.device)
         self.index_queries = torch.empty((2, 4, 128), dtype=torch.bfloat16, device=self.device)
-        self.index_scores = torch.empty((2, 1024), dtype=torch.float32, device=self.device)
+        self.context_limit = int(context_length)
+        self.qsa_lists = qsa_lists(self.context_limit)
+        self.index_scores = torch.empty((2, self.qsa_lists * 1024), dtype=torch.float32, device=self.device)
+        # Per-chunk top-512 lists and the ping-pong buffer of the pairwise merge (unused at one chunk).
+        self.chunk_scores = torch.empty((2, self.qsa_lists, QSATopK), dtype=torch.float32, device=self.device)
+        self.chunk_indices = torch.empty((2, self.qsa_lists, QSATopK), dtype=torch.int32, device=self.device)
+        self.merge_scores = torch.empty_like(self.chunk_scores)
+        self.merge_indices = torch.empty_like(self.chunk_indices)
         self.selected = torch.empty((2, 2051), dtype=torch.int32, device=self.device)
         self.attention_scores = torch.empty((2, 3, 2051), dtype=torch.float32, device=self.device)
         self.core = torch.empty((2, 768), dtype=torch.bfloat16, device=self.device)
@@ -114,8 +137,8 @@ class QSAAttention:
         require_tensor(ring, (ring.shape[0], 1, 128), device=self.device)
         require_tensor(ring_positions, (ring.shape[0], 3), torch.int64, self.device)
         require_tensor(compressed, (compressed.shape[0], 1, 128), device=self.device)
-        if request_tokens.ndim != 2 or request_tokens.shape[1] < 4096:
-            raise FlashContractError("QSA request table must cover context 4096")
+        if request_tokens.ndim != 2 or request_tokens.shape[1] < self.context_limit:
+            raise FlashContractError(f"QSA request table must cover context {self.context_limit}")
         key, value = cache_views(key, value)
         if key.shape != value.shape or key.device != self.device or value.device != self.device or key.shape[0] * 16 > compressed.shape[0]:
             raise FlashContractError("QSA cache capacity or device mismatch")
@@ -123,8 +146,8 @@ class QSAAttention:
         mixed = self.mixed[:rows]
         mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, self.mixer.partials, mixed, self.mixer.state, self.mixer.executions)
         mix = MixArguments(*(tensor.data_ptr() for tensor in mix_tensors), rows, self.mixer.program.timeout_ticks)
-        tensors = (*self.weights, self.rotary_cache, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed, self.projected, self.index_projected, self.queries, self.index_queries, self.index_scores, self.selected, self.attention_scores, self.core, output, self.executions)
-        arguments = QSAArguments(mix, *(tensor.data_ptr() for tensor in tensors), request_tokens.stride(0), request_tokens.shape[0], key.shape[0] * 64, ring.shape[0], self.rotary_cache.shape[0], axes, 0 if axes == 1 else positions.stride(0), key.stride(0), key.stride(1), key.stride(3), value.stride(0), value.stride(1), value.stride(3))
+        tensors = (*self.weights, self.rotary_cache, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed, self.projected, self.index_projected, self.queries, self.index_queries, self.index_scores, self.selected, self.chunk_scores, self.chunk_indices, self.merge_scores, self.merge_indices, self.attention_scores, self.core, output, self.executions)
+        arguments = QSAArguments(mix, *(tensor.data_ptr() for tensor in tensors), request_tokens.stride(0), request_tokens.shape[0], key.shape[0] * 64, ring.shape[0], self.rotary_cache.shape[0], axes, 0 if axes == 1 else positions.stride(0), key.stride(0), key.stride(1), key.stride(3), value.stride(0), value.stride(1), value.stride(3), self.qsa_lists, self.context_limit)
         with torch.cuda.device(self.device):
             self.program.base.check(self.program.library.flash_qsa(ctypes.byref(arguments), torch.cuda.current_stream(self.device).cuda_stream))
         return output, (hidden, self.mixer.normalized[:rows])
@@ -147,7 +170,7 @@ class QSAAttention:
         first, second = value[..., :32], value[..., 32:64]
         return torch.cat((first * cosine - second * sine, second * cosine + first * sine, value[..., 64:]), dim=-1)
 
-    def native(self, mixed, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed):
+    def native(self, mixed, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed, selection=None):
         from sglang.srt.layers.attention.qsa.sparse_attn import sparse_gqa_packed_decode_triton
         from sglang.kernels.ops.elementwise.fast_topk import fast_topk
 
@@ -167,7 +190,7 @@ class QSAAttention:
         ring[slots, 0] = index_projected[:, 512:]
         ring_positions[slots] = positions.unsqueeze(1).expand(rows, 3) if positions.ndim == 1 else positions.transpose(0, 1)
         selected = torch.full((rows, 2051), -1, dtype=torch.int32, device=self.device)
-        logits = torch.full((rows, 1024), -torch.inf, dtype=torch.float32, device=self.device)
+        logits = torch.full((rows, self.qsa_lists * 1024), -torch.inf, dtype=torch.float32, device=self.device)
         packed_keys, packed_values, counts = [], [], []
         for row in range(rows):
             length = int(lengths[row])
@@ -187,6 +210,10 @@ class QSAAttention:
             else:
                 tokens = torch.empty(0, dtype=torch.int64, device=self.device)
             tokens = torch.cat((tokens, torch.arange(groups * 4, length, device=self.device)))
+            if selection is not None:
+                # Evaluate the reference on a given token list instead of native's own top-k, to
+                # separate the selection from the arithmetic when the two tie-break differently.
+                tokens = selection[row][selection[row] >= 0].long()
             selected[row, :tokens.numel()] = tokens.int()
             physical = request_tokens[request, tokens].long()
             packed_keys.append(key[physical // 64, physical % 64])
