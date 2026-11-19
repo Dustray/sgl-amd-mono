@@ -62,6 +62,10 @@ struct QSAArguments {
     int64_t value_dim_stride;
     int64_t qsa_lists;
     int64_t context_limit;
+    // Fused MTP verify: request rows repeat (DRAFT_TOKENS rows per request), so the
+    // decode-side "no duplicate request rows" check must not fire; locations still must
+    // be unique.
+    int64_t verify_requests;
 };
 
 __device__ __forceinline__ float qsa_round(float value) { return float(BFloat16(value)); }
@@ -120,7 +124,10 @@ __global__ __launch_bounds__(Threads, 1) void qsa_attention(QSAArguments args) {
             }
             owned = owned && args.request_tokens[request * args.request_stride + length - 1] == location;
             bool reserved = request == 0 && location == 0;
-            if (!reserved && args.mix.rows == 2 && row == 0 && (args.requests[0] == args.requests[1] || args.locations[0] == args.locations[1])) owned = false;
+            if (!reserved && args.verify_requests == 0 && args.mix.rows == 2 && row == 0 && (args.requests[0] == args.requests[1] || args.locations[0] == args.locations[1])) owned = false;
+            if (!reserved && args.verify_requests > 0) {
+                for (int other = 0; other < row; ++other) owned = owned && args.locations[row] != args.locations[other];
+            }
             if (!owned) atomicCAS(args.mix.synchronization + 2, 0u, 400u);
         }
         if (valid) {

@@ -53,6 +53,31 @@ def test_graph_eager_mismatch_restores_live_state_before_raising():
     assert not graph.checks[0]["accepted"]
 
 
+@pytest.mark.parametrize("native_shadow,expected_during", [(True, 1), (False, 0)])
+def test_validate_enables_native_shadow_only_for_verify(native_shadow, expected_during):
+    """A graphed verify never touches the eager path, so the first replay's eager reference must
+    run with the per-module native shadow back on; a plain-decode graph keeps it off."""
+    cache = torch.tensor([7.0])
+    result = SimpleNamespace(next_token_logits=torch.tensor([[1.0, 2.0]]))
+    seen = {}
+
+    def eager(*args):
+        seen["shadow_during"] = runtime.shadow_remaining
+        return SimpleNamespace(next_token_logits=result.next_token_logits.clone())
+
+    runtime = SimpleNamespace(
+        enabled=False, shadow_remaining=5, shadow_steps=1,
+        model=SimpleNamespace(last_hc_hidden_states=None),
+        full_model_shadow_checks=[{"accepted": True}], validated_batch_sizes=set(), shadow_remaining_by_batch={},
+        original_forward=eager, _full_model_shadow=lambda *a, **k: None,
+    )
+    graph = GraphExecution(runtime)
+    batch = SimpleNamespace(batch_size=1, input_ids=torch.tensor([1]), positions=torch.tensor([2]))
+    graph._validate(batch, result, [("cache", cache)], [torch.tensor([7.0])], native_shadow=native_shadow)
+    assert seen["shadow_during"] == expected_during
+    assert graph.checks[0]["accepted"]
+
+
 def test_benchmark_route_cannot_change_captured_graph(tmp_path, monkeypatch):
     from sgl_amd_mono_0518.flash_next import apply_benchmark_mode
 

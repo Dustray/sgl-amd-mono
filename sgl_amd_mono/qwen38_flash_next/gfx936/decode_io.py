@@ -7,6 +7,7 @@ import subprocess
 
 import torch
 
+from .geometry import MAX_ROWS
 from .program import FlashContractError, HIPProgram, MixArguments, SyncArguments, require_tensor
 
 
@@ -80,16 +81,16 @@ class DecodeIO:
         processor = model.logits_processor
         if processor.use_fp32_lm_head or processor.vocab_size != 248320 or not processor.do_tensor_parallel_all_gather or processor.logit_scale is not None or processor.final_logit_softcapping:
             raise FlashContractError("Decode IO requires the native BF16 TP8 logits contract without scaling")
-        self.local_embedding = torch.empty((2, 2560), dtype=torch.bfloat16, device=self.device)
+        self.local_embedding = torch.empty((MAX_ROWS, 2560), dtype=torch.bfloat16, device=self.device)
         self.reduced_embedding = torch.empty_like(self.local_embedding)
-        self.local_logits = torch.empty((2, 31040), dtype=torch.bfloat16, device=self.device)
+        self.local_logits = torch.empty((MAX_ROWS, 31040), dtype=torch.bfloat16, device=self.device)
         self.entry_executions = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.tail_executions = torch.zeros_like(self.entry_executions)
 
     def entry(self, input_ids):
         rows = input_ids.numel()
-        if rows not in (1, 2) or input_ids.dtype not in (torch.int32, torch.int64):
-            raise FlashContractError("Decode embedding requires one or two integer token IDs")
+        if not 1 <= rows <= MAX_ROWS or input_ids.dtype not in (torch.int32, torch.int64):
+            raise FlashContractError("Decode embedding requires up to MAX_ROWS integer token IDs")
         require_tensor(input_ids, (rows,), input_ids.dtype, self.device)
         output = torch.empty((rows, 10240), dtype=torch.bfloat16, device=self.device)
         tensors = (input_ids, self.embedding, self.local_embedding, self.reduced_embedding, output, self.entry_executions)
@@ -101,8 +102,8 @@ class DecodeIO:
     def tail(self, hidden):
         rows = hidden.shape[0]
         require_tensor(hidden, (rows, 10240), device=self.device)
-        if rows not in (1, 2):
-            raise FlashContractError("Decode tail requires one or two rows")
+        if not 1 <= rows <= MAX_ROWS:
+            raise FlashContractError(f"Decode tail requires up to {MAX_ROWS} rows")
         mixed = torch.empty((rows, 2560), dtype=torch.bfloat16, device=self.device)
         logits = torch.empty((rows, 248320), dtype=torch.bfloat16, device=self.device)
         mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, self.mixer.partials, mixed, self.mixer.state, self.mixer.executions)

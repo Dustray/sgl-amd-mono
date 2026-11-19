@@ -1,12 +1,14 @@
 import functools
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
 import torch
 
 from .program import FlashContractError, HCMix, PeerGroup, PostAttention
+from .geometry import DRAFT_TOKENS, MAX_ROWS
 from .gdn import GDNAttention
 from .qsa import QSAAttention, cache_views
 from .ple import PLE
@@ -14,6 +16,32 @@ from .decode_io import DecodeIO
 
 
 logger = logging.getLogger(__name__)
+
+
+def bf16_ulp_error(actual, expected):
+    """Worst absolute difference, in bf16 ULPs taken at the reference tensor's peak magnitude.
+
+    Why the peak and not the RMS or each element: measured on the real layer-16 verify dump
+    (2026-11-19, rank 6), 70% of the 10240 elements differ and the elementwise relative error
+    is bimodal -- elements at |v| >= 0.05 sit at 0.5 ULP (correct rounding) while the 1110
+    elements below 1e-3 reach 15843 ULP. That is cancellation, not arithmetic: the absolute
+    error stays capped at 4.9e-4 across the whole tensor while the values themselves approach
+    zero. An elementwise ULP therefore explodes on the cancelled elements, and an RMS-scaled
+    one is dragged by the same near-zero mass (that dump's RMS is 0.0116 against a peak of
+    0.136). The peak is the stable scale: 4.9e-4 is exactly half a ULP at 0.136, the
+    correct-rounding bound, while nrmse reads 0.00605 for the same tensors.
+
+    A real divergence -- a wrong expert, a mis-indexed row -- moves an element by something of
+    order the tensor's own scale, which is hundreds of ULPs here, so this stays discriminative.
+    """
+    difference = float((actual.detach().float() - expected.detach().float()).abs().max())
+    peak = float(expected.detach().float().abs().max())
+    if not math.isfinite(peak) or not math.isfinite(difference):
+        return float("inf")
+    if peak == 0.0:
+        return 0.0 if difference == 0.0 else float("inf")
+    # bf16 keeps 8 significand bits, so the step at |v| is 2**(floor(log2|v|) - 7).
+    return difference / 2.0 ** (math.floor(math.log2(peak)) - 7)
 
 
 def error_metrics(actual, expected):
@@ -54,6 +82,12 @@ class FlashRuntime:
         self.fusion_enabled = True
         self.graph_capture_active = False
         self.graph = None
+        from .contract import spec_verify_enabled
+
+        # Routes TARGET_VERIFY batches (4 fused rows per request) through the mono
+        # kernels; without it a speculative server never installs this runtime.
+        self.spec_verify = spec_verify_enabled(runner.server_args)
+
         self.report_dir = Path(os.environ.get("SGLANG_AMD_FLASH_REPORT_DIR", "monokernel_reports/flash_next_tp8")).resolve()
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.validation = []
@@ -340,6 +374,7 @@ class FlashRuntime:
                 return result
             batch = kwargs["forward_batch"]
             hidden = kwargs["hidden_states"]
+            verify = bool(batch.forward_mode.is_target_verify())
             if hidden.shape[-1] == 2560:
                 hidden = torch.cat([hidden] * 4, dim=-1)
             if layer.ple is not None:
@@ -347,26 +382,33 @@ class FlashRuntime:
                 from sglang.srt.models.qwen4_exp import _ple_track_targets
 
                 ple_batch = kwargs["ple_batch"]
-                if not ple_batch.use_decode_fast_path or kwargs.get("residual") is not None:
-                    raise FlashContractError("PLE fused decode requires one token per row and no pending residual")
-                conv = get_req_to_token_pool().short_conv_layer_cache(layer.ple.layer_id)
-                if self.shadow_remaining:
-                    before_conv = conv.clone()
-                output = self.ple[layer_id](hidden, ple_batch.ngram_context, ple_batch.state_indices, conv)
-                if self.shadow_remaining:
-                    actual_conv = conv.clone()
-                    conv.copy_(before_conv)
-                    expected = hidden + layer.ple(hidden, batch, ple_batch)
-                    checks = {"output": error_metrics(output, expected), "conv": error_metrics(actual_conv, conv)}
-                    conv.copy_(actual_conv)
-                    self.shadow_checks.append({"kind": "ple", "layer": layer_id, "checks": checks})
-                    if any(not check["finite"] or check["nrmse"] > 0.008 for check in checks.values()):
-                        self._shadow_failure(f"Flash-Next PLE serving shadow failed at layer {layer_id}: {checks}")
-                track = _ple_track_targets(batch, ple_batch)
-                if track is not None:
-                    track_indices, _ = track
-                    conv[track_indices] = conv.index_select(0, ple_batch.state_indices)
-                hidden = output
+                if verify:
+                    # Fused PLE verify comes later; the native verify branch fills the
+                    # short-conv intermediates that the worker's own commit replays into
+                    # the working state, and does not track, so skip the fused fast path
+                    # and the decode-side track entirely.
+                    hidden = hidden + layer.ple(hidden, batch, ple_batch)
+                else:
+                    if not ple_batch.use_decode_fast_path or kwargs.get("residual") is not None:
+                        raise FlashContractError("PLE fused decode requires one token per row and no pending residual")
+                    conv = get_req_to_token_pool().short_conv_layer_cache(layer.ple.layer_id)
+                    if self.shadow_remaining:
+                        before_conv = conv.clone()
+                    output = self.ple[layer_id](hidden, ple_batch.ngram_context, ple_batch.state_indices, conv)
+                    if self.shadow_remaining:
+                        actual_conv = conv.clone()
+                        conv.copy_(before_conv)
+                        expected = hidden + layer.ple(hidden, batch, ple_batch)
+                        checks = {"output": error_metrics(output, expected), "conv": error_metrics(actual_conv, conv)}
+                        conv.copy_(actual_conv)
+                        self.shadow_checks.append({"kind": "ple", "layer": layer_id, "checks": checks})
+                        if any(not check["finite"] or check["nrmse"] > 0.008 for check in checks.values()):
+                            self._shadow_failure(f"Flash-Next PLE serving shadow failed at layer {layer_id}: {checks}")
+                    track = _ple_track_targets(batch, ple_batch)
+                    if track is not None:
+                        track_indices, _ = track
+                        conv[track_indices] = conv.index_select(0, ple_batch.state_indices)
+                    hidden = output
             if self.gdn[layer_id] is not None:
                 from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -375,22 +417,48 @@ class FlashRuntime:
                 indices = backend.forward_metadata.mamba_cache_indices
                 if self.shadow_remaining:
                     reference_conv, reference_ssm = cache.conv[0].clone(), cache.temporal.clone()
-                attention, residuals = self.gdn[layer_id](hidden, cache.conv[0], cache.temporal, indices)
-                backend._track_mamba_state_decode(batch, cache.conv[0], cache.temporal, indices, layer.linear_attn.layer_id)
+                if verify:
+                    # One fused launch over requests * DRAFT_TOKENS rows. The kernel
+                    # replays the draft chain per request: conv advances the working
+                    # window and snapshots every step into the scratch (exactly like
+                    # native causal_conv1d verify), while the recurrent state stays in
+                    # registers with per-step snapshots — native likewise never touches
+                    # the working ssm during verify (disable_state_update). The worker's
+                    # own commit scatters the accepted-prefix snapshots back, so the
+                    # decode-side track must not run here.
+                    attention, residuals = self.gdn[layer_id].verify(hidden, cache.conv[0], cache.temporal, indices, backend.verify_intermediate_state_indices, cache.intermediate_conv_window[0], cache.intermediate_ssm, batch.batch_size)
+                else:
+                    attention, residuals = self.gdn[layer_id](hidden, cache.conv[0], cache.temporal, indices)
+                    backend._track_mamba_state_decode(batch, cache.conv[0], cache.temporal, indices, layer.linear_attn.layer_id)
                 if self.shadow_remaining:
                     actual_conv, actual_ssm = cache.conv[0].clone(), cache.temporal.clone()
+                    # Verify's real product is the per-step scratch (the worker's commit scatters it
+                    # back), and the native rerun below overwrites it, so save mono's copy, compare it,
+                    # and put it back; otherwise the shadow would check and keep native's snapshots.
+                    scratch = self._verify_scratch_views(cache, backend, batch.batch_size) if verify else []
+                    actual_scratch = [tensor.clone() for _, tensor in scratch]
                     cache.conv[0].copy_(reference_conv)
                     cache.temporal.copy_(reference_ssm)
                     mixed, _ = layer.attn_hyper_connection.mix(hidden)
                     fused_mixed = self.gdn[layer_id].mixed[:hidden.shape[0]]
                     reference_attention = layer.linear_attn(fused_mixed, batch)
                     checks = {"mixed": error_metrics(fused_mixed, mixed), "output": error_metrics(attention, reference_attention), "conv": error_metrics(actual_conv, cache.conv[0]), "ssm": error_metrics(actual_ssm, cache.temporal)}
+                    if verify:
+                        # A verify row is one draft step, so this output is the end of a
+                        # DRAFT_TOKENS-long chain, not the single step the nrmse gate was
+                        # calibrated on. Report how far apart the two sides are in bf16 ULPs as
+                        # well; see `_gdn_shadow_failures` for how the two are combined.
+                        checks["output"]["bf16_ulp"] = bf16_ulp_error(attention, reference_attention)
+                    for (name, tensor), actual in zip(scratch, actual_scratch):
+                        checks[name] = error_metrics(actual, tensor)
+                        tensor.copy_(actual)
                     cache.conv[0].copy_(actual_conv)
                     cache.temporal.copy_(actual_ssm)
                     self.shadow_checks.append({"kind": "gdn", "layer": layer_id, "checks": checks})
-                    if any(not check["finite"] or check["nrmse"] > 0.006 for check in checks.values()):
+                    failed = self._gdn_shadow_failures(checks)
+                    if failed:
                         torch.save({"hidden": hidden, "mixed": fused_mixed, "native_mixed": mixed, "actual": attention, "expected": reference_attention, "before_conv": reference_conv, "before_ssm": reference_ssm, "indices": indices, "projected": self.gdn[layer_id].projected, "projected_ba": self.gdn[layer_id].projected_ba, "recurrent": self.gdn[layer_id].recurrent, "core": self.gdn[layer_id].core}, self.report_dir / f"failed-gdn-shadow-layer-{layer_id}-rank-{self.rank}.pt")
-                        self._shadow_failure(f"Flash-Next GDN serving shadow failed at layer {layer_id}: {checks}")
+                        self._shadow_failure(f"Flash-Next GDN serving shadow failed at layer {layer_id} on {failed}: {checks}")
             else:
                 from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -401,7 +469,19 @@ class FlashRuntime:
                 cache_tensors = (key, value, ring, ring_positions, compressed)
                 if self.shadow_remaining:
                     before = [tensor.clone() for tensor in cache_tensors]
-                attention, residuals = self.qsa[layer_id](hidden, kwargs["positions"], batch.seq_lens.to(torch.int32), batch.req_pool_indices, batch.out_cache_loc, backend.req_to_token_pool.req_to_token, key, value, ring, ring_positions, compressed)
+                if verify:
+                    # One row per draft token: request repeated per step; batch.seq_lens is the
+                    # pre-verify length, so row j of a group sees prefix + j + 1 tokens, exactly
+                    # the per-row lengths native QwenSparseAttnBackend._graph_speculative_layout
+                    # builds. The scheduler pre-wrote req_to_token and out_cache_loc for every
+                    # row, which is what the kernel validates.
+                    requests = batch.req_pool_indices.repeat_interleave(DRAFT_TOKENS)
+                    steps = torch.arange(1, DRAFT_TOKENS + 1, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device)
+                    lengths = (batch.seq_lens.repeat_interleave(DRAFT_TOKENS) + steps.repeat(batch.batch_size)).to(torch.int32)
+                else:
+                    requests = batch.req_pool_indices
+                    lengths = batch.seq_lens.to(torch.int32)
+                attention, residuals = self.qsa[layer_id](hidden, kwargs["positions"], lengths, requests, batch.out_cache_loc, backend.req_to_token_pool.req_to_token, key, value, ring, ring_positions, compressed, verify=verify)
                 if self.shadow_remaining:
                     actual_cache = [tensor.clone() for tensor in cache_tensors]
                     for tensor, saved in zip(cache_tensors, before):
@@ -415,7 +495,7 @@ class FlashRuntime:
                     # row at context 200k is nrmse ~0.006, under the gate), so also compare exactly the
                     # rows this step wrote. Compressed keys only decide the index top-k above 512 groups,
                     # so a wrong decode-time write is invisible at short context.
-                    checks.update(self._qsa_written_checks(batch, backend, cache_tensors, actual_cache))
+                    checks.update(self._qsa_written_checks(requests, lengths, batch.out_cache_loc, backend, cache_tensors, actual_cache))
                     for tensor, actual in zip(cache_tensors, actual_cache):
                         tensor.copy_(actual)
                     self.shadow_checks.append({"kind": "qsa", "layer": layer_id, "checks": checks})
@@ -446,19 +526,28 @@ class FlashRuntime:
 
         layer.forward = forward
 
-    def _shadow_failure(self, message):
+    def _shadow_failure(self, message, discriminating=True):
+        """Record a shadow mismatch, and raise unless the check cannot discriminate.
+
+        ``discriminating=False`` marks a comparison whose reference is noisier than its own
+        gate, so a failure says nothing about mono and must never stop the server. Only the
+        full-model logits check is in that position today (see ``_full_model_shadow``). Every
+        per-module check stays fatal by default -- those are the ones that catch kernel bugs --
+        and ``SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES=1`` still downgrades all of them, so the
+        flag keeps its documented meaning.
+        """
         self.serving_shadow_failure = message
-        self.serving_shadow_failures.append({"step": self.completed_decode_steps, "reason": message})
+        self.serving_shadow_failures.append({"step": self.completed_decode_steps, "reason": message, "discriminating": discriminating})
         self.save()
-        if not self.shadow_record_failures:
+        if discriminating and not self.shadow_record_failures:
             raise FlashContractError(message)
         logger.error("AMD_FLASH_CORRECTNESS_DIAGNOSTIC %s", message)
 
     @staticmethod
-    def _qsa_written_checks(batch, backend, expected_cache, actual_cache):
-        lengths = batch.seq_lens.long()
-        requests = batch.req_pool_indices.long()
-        locations = batch.out_cache_loc.long()
+    def _qsa_written_checks(row_requests, row_lengths, row_locations, backend, expected_cache, actual_cache):
+        lengths = row_lengths.long()
+        requests = row_requests.long()
+        locations = row_locations.long()
         key, value, ring, ring_positions, compressed = expected_cache
         actual_key, actual_value, actual_ring, actual_ring_positions, actual_compressed = actual_cache
         (key, value), (actual_key, actual_value) = cache_views(key, value), cache_views(actual_key, actual_value)
@@ -544,19 +633,93 @@ class FlashRuntime:
         logger.info("AMD_FLASH_QSA_CAPTURE file=%s matched_input=%s", destination, captured["matched_input_check"])
 
     def supports(self, batch):
-        return batch.forward_mode.is_decode() and batch.batch_size in (1, 2) and batch.input_ids.numel() == batch.batch_size and getattr(batch, "input_embeds", None) is None
+        if getattr(batch, "input_embeds", None) is not None:
+            return False
+        if batch.batch_size not in (1, 2):
+            return False
+        if batch.forward_mode.is_decode():
+            return batch.input_ids.numel() == batch.batch_size
+        # Fused MTP verify: the native worker front-packs DRAFT_TOKENS rows per
+        # request, matching the kernel row model (MAX_ROWS capacity).
+        return batch.forward_mode.is_target_verify() and self.spec_verify and batch.input_ids.numel() == batch.batch_size * DRAFT_TOKENS
 
-    def _decode_states(self):
+    @staticmethod
+    def _gdn_shadow_failures(checks):
+        """Names of the GDN shadow checks that fail; empty means the layer passed.
+
+        nrmse at 0.006 is the decode gate and stays the primary test. A check that also
+        carries ``bf16_ulp`` (only the fused verify output) may clear it on that instead,
+        because nrmse normalises by an RMS that near-zero, cancellation-dominated elements
+        drag down: measured 2026-11-19 on a real verify step, GDN layer 16 read nrmse 0.00605
+        while its worst element was half a ULP from native at the tensor's peak -- the
+        correct-rounding bound. The per-row split of that same dump showed no growth along the
+        draft chain (row 0 0.0061, row 3 0.0050), so this is not chain accumulation and the
+        tolerance is not about chain length: it is the slack between two implementations that
+        round independently and anything a real divergence would produce (hundreds).
+
+        The tolerance is 16, not ``DRAFT_TOKENS``: a second dump the same day (layer 32,
+        rank 3, serving verify, nrmse 0.0113 / 6 ULP at a peak of 0.0615) was cleared by
+        rebuilding the whole verify chain off the checkpoint on CPU -- bf16 in_proj (both
+        buffers bit-identical), conv+silu, exp/softplus gating, l2norm, the delta recurrence
+        in fp32 and the sigmoid(z) norm -- which reproduced mono's ``recurrent`` buffer
+        bit for bit and left <= 1.3 ULP in ``core``. So mono is the exact chain and the
+        6 ULP is the reference side's independent rounding: native runs verify through the
+        aiter Triton kernel (its own fp32 accumulation orders), with native in_proj/o_proj
+        GEMMs and an 8-way bf16 all-reduce summed in a different order on top. That noise
+        scales with the layer's activation scale, not the peak, so a small-peak layer reads
+        many ULPs at the same absolute error (layer 16: peak 0.136 -> 0.5 ULP; layer 32:
+        peak 0.0615 -> 6 ULP at max_abs 1.5e-3 for both). Everything a real divergence
+        produces stays orders above this: a flipped step scores nrmse ~1.4, a flipped
+        expert ~0.2, and a mis-indexed row moves whole 128-wide head blocks.
+        """
+        failures = []
+        for name, check in checks.items():
+            if not check["finite"]:
+                failures.append(name)
+            elif check["nrmse"] > 0.006 and check.get("bf16_ulp", float("inf")) > 16.0:
+                failures.append(name)
+        return failures
+
+    @staticmethod
+    def _verify_scratch_views(cache, backend, requests):
+        """Non-overlapping views of the speculative scratch rows one verify pass writes.
+
+        ``intermediate_conv_window`` uses SGLang's deduplicated layout: an ``as_strided`` view
+        whose step stride equals its window stride, so consecutive steps share columns and
+        ``copy_`` into it is rejected as internal overlap. For that layout the row is
+        re-viewed as its physical ``[dim, steps + width - 1]`` envelope, which covers exactly
+        the same memory without overlap. The dense layout is used as is.
+        """
+        views = []
+        for row in backend.verify_intermediate_state_indices[:requests].tolist():
+            window = cache.intermediate_conv_window[0][row]
+            steps, dim, width = window.shape
+            if window.stride(0) == window.stride(2):
+                window = window.as_strided((dim, steps + width - 1), (window.stride(1), window.stride(2)), window.storage_offset())
+            views.append((f"conv_window.{row}", window))
+            views.append((f"intermediate_ssm.{row}", cache.intermediate_ssm[row]))
+        return views
+
+    def _decode_states(self, batch=None):
         from sglang.srt.model_executor.forward_context import get_attn_backend, get_req_to_token_pool
 
         backend = get_attn_backend()
         pool = get_req_to_token_pool()
         kv_pool = backend.full_attn_backend.token_to_kv_pool
+        verify = batch is not None and batch.forward_mode.is_target_verify()
         tensors = [("ngram_context", pool.ngram_pool.context), ("qsa_positions", kv_pool.qsa_rope_position_buffer)]
+        if verify:
+            # Native verify writes the PLE per-step side states too; the commit reads them.
+            for name, owner, attribute in (("ngram_intermediate", "ngram_pool", "intermediate_context"), ("ple_conv_intermediate", "short_conv_pool", "intermediate_conv_state")):
+                tensor = getattr(getattr(pool, owner, None), attribute, None)
+                if tensor is not None:
+                    tensors.append((name, tensor))
         for layer_id, layer in enumerate(self.model.layers):
             if self.gdn[layer_id] is not None:
                 cache = backend.linear_attn_backend.req_to_token_pool.mamba2_layer_cache(layer.linear_attn.layer_id)
                 tensors.extend(((f"conv.{layer_id}", cache.conv[0]), (f"ssm.{layer_id}", cache.temporal)))
+                if verify:
+                    tensors.extend((f"{name}.{layer_id}", view) for name, view in self._verify_scratch_views(cache, backend.linear_attn_backend, batch.batch_size))
             else:
                 tensors.extend(((f"key.{layer_id}", kv_pool.get_key_buffer(layer_id)), (f"value.{layer_id}", kv_pool.get_value_buffer(layer_id)), (f"qsa_ring.{layer_id}", kv_pool.get_qsa_key_state_buffer(layer_id)), (f"qsa_compressed.{layer_id}", kv_pool.get_qsa_compressed_k_buffer(layer_id))))
             if layer.ple is not None:
@@ -595,8 +758,17 @@ class FlashRuntime:
                 if ("full_model", 0) not in self.failure_captures:
                     torch.save({"actual_logits": actual_logits, "expected_logits": expected_logits, "native_repeat_logits": repeated.next_token_logits.clone()}, self.report_dir / f"failed-full-model-step-{self.completed_decode_steps}-rank-{self.rank}.pt")
                     self.failure_captures.add(("full_model", 0))
-                message = f"Flash-Next full-model same-state shadow failed: {check}; distribution={distribution}"
-                self._shadow_failure(message)
+                # Score native's own re-runs through the same gate. Native HC mix sums its
+                # split-K with FP32 atomics, so the same input can flip the 10th/11th MoE
+                # expert and the reference is not reproducible: measured 2026-11-19 on a verify
+                # batch, native against itself scored KL 0.02118 / TV 0.085 while the gate is
+                # KL 0.01 / TV 0.05. When the reference misses its own gate this comparison
+                # cannot tell a mono defect from reference noise, so it records instead of
+                # killing the server. The per-module shadows stay fatal and keep that job.
+                native_accepted = all(logits_accepted(repeat["distribution"]) for repeat in entry["native_repeats"])
+                entry["reference_reproducible"] = native_accepted
+                message = f"Flash-Next full-model same-state shadow failed: {check}; distribution={distribution}; reference_reproducible={native_accepted}"
+                self._shadow_failure(message, discriminating=native_accepted)
         finally:
             self.enabled = True
             self.reference_layer_checks = None
@@ -621,8 +793,12 @@ class FlashRuntime:
             if not self.enabled and batch.forward_mode.is_extend() and self.shadow_rearm_on_prefill:
                 self.shadow_remaining_by_batch.clear()
                 self.shadow_remaining = self.shadow_steps
+            # Verify and decode count their shadow steps separately (decode keeps the plain
+            # batch-size key that graph.py also uses), so one cannot use up the other's checks.
+            verify = bool(self.enabled) and bool(getattr(batch.forward_mode, "is_target_verify", lambda: False)())
+            shadow_key = ("verify", int(batch.batch_size)) if verify else int(batch.batch_size)
             if self.enabled and not getattr(self, "graph_capture_active", False):
-                self.shadow_remaining = self.shadow_remaining_by_batch.setdefault(int(batch.batch_size), self.shadow_steps)
+                self.shadow_remaining = self.shadow_remaining_by_batch.setdefault(shadow_key, self.shadow_steps)
             key = (batch.forward_mode.name, int(batch.batch_size), self.enabled)
             if key not in self.forward_keys:
                 self.forward_keys.add(key)
@@ -630,7 +806,7 @@ class FlashRuntime:
             try:
                 if self.enabled and not getattr(self, "graph_capture_active", False):
                     self.begin_stage_timing_step()
-                states = self._decode_states() if self.enabled and self.shadow_remaining else []
+                states = self._decode_states(batch) if self.enabled and self.shadow_remaining else []
                 before = [tensor.clone() for _, tensor in states]
                 result = original(*args, **kwargs)
                 if self.enabled and not getattr(self, "graph_capture_active", False) and not torch.cuda.is_current_stream_capturing():
@@ -641,8 +817,8 @@ class FlashRuntime:
                     self.finish_stage_timing_step()
                     if self.shadow_remaining:
                         self.shadow_remaining -= 1
-                        self.shadow_remaining_by_batch[int(batch.batch_size)] = self.shadow_remaining
-                        if not self.shadow_remaining and not any(check["rows"] == int(batch.batch_size) and not check.get("accepted", True) for check in self.full_model_shadow_checks):
+                        self.shadow_remaining_by_batch[shadow_key] = self.shadow_remaining
+                        if not verify and not self.shadow_remaining and not any(check["rows"] == int(batch.batch_size) and not check.get("accepted", True) for check in self.full_model_shadow_checks):
                             self.validated_batch_sizes.add(int(batch.batch_size))
                         self.save()
                 return result

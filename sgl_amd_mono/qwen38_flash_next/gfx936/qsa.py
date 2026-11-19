@@ -8,6 +8,7 @@ import subprocess
 import torch
 from torch.nn import functional
 
+from .geometry import DRAFT_TOKENS, MAX_ROWS
 from .program import FlashContractError, HIPProgram, MixArguments, require_tensor
 
 
@@ -15,7 +16,7 @@ class QSAArguments(ctypes.Structure):
     _fields_ = [("mix", MixArguments)] + [(name, ctypes.c_void_p) for name in (
         "qkv_weight", "q_norm", "k_norm", "output_weight", "index_weight", "index_q_norm", "index_k_norm", "rotary_cache", "positions", "sequence_lengths", "requests", "locations", "request_tokens", "key_cache", "value_cache", "index_ring", "ring_positions", "compressed_keys", "projected", "index_projected", "queries", "index_queries", "index_scores", "selected", "chunk_scores", "chunk_indices", "merge_scores", "merge_indices", "attention_scores", "core", "output", "executions",
     )] + [(name, ctypes.c_int64) for name in (
-        "request_stride", "request_count", "cache_slots", "ring_slots", "rotary_rows", "position_axes", "position_axis_stride", "key_page_stride", "key_token_stride", "key_dim_stride", "value_page_stride", "value_token_stride", "value_dim_stride", "qsa_lists", "context_limit",
+        "request_stride", "request_count", "cache_slots", "ring_slots", "rotary_rows", "position_axes", "position_axis_stride", "key_page_stride", "key_token_stride", "key_dim_stride", "value_page_stride", "value_token_stride", "value_dim_stride", "qsa_lists", "context_limit", "verify_requests",
     )]
 
 
@@ -106,29 +107,29 @@ class QSAAttention:
         require_tensor(self.rotary_cache, self.rotary_cache.shape, torch.float32, self.device)
         if self.rotary_cache.ndim != 2 or self.rotary_cache.shape[1] != 64:
             raise FlashContractError("QSA requires a 64-wide RoPE cache")
-        self.projected = torch.empty((2, 2048), dtype=torch.bfloat16, device=self.device)
-        self.mixed = torch.empty((2, 2560), dtype=torch.bfloat16, device=self.device)
-        self.index_projected = torch.empty((2, 640), dtype=torch.bfloat16, device=self.device)
-        self.queries = torch.empty((2, 3, 256), dtype=torch.bfloat16, device=self.device)
-        self.index_queries = torch.empty((2, 4, 128), dtype=torch.bfloat16, device=self.device)
+        self.projected = torch.empty((MAX_ROWS, 2048), dtype=torch.bfloat16, device=self.device)
+        self.mixed = torch.empty((MAX_ROWS, 2560), dtype=torch.bfloat16, device=self.device)
+        self.index_projected = torch.empty((MAX_ROWS, 640), dtype=torch.bfloat16, device=self.device)
+        self.queries = torch.empty((MAX_ROWS, 3, 256), dtype=torch.bfloat16, device=self.device)
+        self.index_queries = torch.empty((MAX_ROWS, 4, 128), dtype=torch.bfloat16, device=self.device)
         self.context_limit = int(context_length)
         self.qsa_lists = qsa_lists(self.context_limit)
-        self.index_scores = torch.empty((2, self.qsa_lists * 1024), dtype=torch.float32, device=self.device)
+        self.index_scores = torch.empty((MAX_ROWS, self.qsa_lists * 1024), dtype=torch.float32, device=self.device)
         # Per-chunk top-512 lists and the ping-pong buffer of the pairwise merge (unused at one chunk).
-        self.chunk_scores = torch.empty((2, self.qsa_lists, QSATopK), dtype=torch.float32, device=self.device)
-        self.chunk_indices = torch.empty((2, self.qsa_lists, QSATopK), dtype=torch.int32, device=self.device)
+        self.chunk_scores = torch.empty((MAX_ROWS, self.qsa_lists, QSATopK), dtype=torch.float32, device=self.device)
+        self.chunk_indices = torch.empty((MAX_ROWS, self.qsa_lists, QSATopK), dtype=torch.int32, device=self.device)
         self.merge_scores = torch.empty_like(self.chunk_scores)
         self.merge_indices = torch.empty_like(self.chunk_indices)
-        self.selected = torch.empty((2, 2051), dtype=torch.int32, device=self.device)
-        self.attention_scores = torch.empty((2, 3, 2051), dtype=torch.float32, device=self.device)
-        self.core = torch.empty((2, 768), dtype=torch.bfloat16, device=self.device)
+        self.selected = torch.empty((MAX_ROWS, 2051), dtype=torch.int32, device=self.device)
+        self.attention_scores = torch.empty((MAX_ROWS, 3, 2051), dtype=torch.float32, device=self.device)
+        self.core = torch.empty((MAX_ROWS, 768), dtype=torch.bfloat16, device=self.device)
         self.executions = torch.zeros(1, dtype=torch.int32, device=self.device)
 
-    def __call__(self, hidden, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed):
+    def __call__(self, hidden, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed, verify=False):
         rows = hidden.shape[0]
         require_tensor(hidden, (rows, 10240), device=self.device)
-        if rows not in (1, 2):
-            raise FlashContractError("QSA decode supports one or two rows")
+        if not 1 <= rows <= MAX_ROWS or (verify and rows % DRAFT_TOKENS):
+            raise FlashContractError(f"QSA decode supports up to {MAX_ROWS} rows and verify a whole number of {DRAFT_TOKENS}-token chains")
         axes = 1 if positions.ndim == 1 else 3
         require_tensor(positions, (rows,) if axes == 1 else (3, rows), torch.int64, self.device)
         for tensor, dtype in ((lengths, torch.int32), (requests, torch.int64), (locations, torch.int64)):
@@ -147,7 +148,7 @@ class QSAAttention:
         mix_tensors = (hidden, *self.mixer.weights, self.mixer.normalized, self.mixer.lowrank, self.mixer.gates, self.mixer.partials, mixed, self.mixer.state, self.mixer.executions)
         mix = MixArguments(*(tensor.data_ptr() for tensor in mix_tensors), rows, self.mixer.program.timeout_ticks)
         tensors = (*self.weights, self.rotary_cache, positions, lengths, requests, locations, request_tokens, key, value, ring, ring_positions, compressed, self.projected, self.index_projected, self.queries, self.index_queries, self.index_scores, self.selected, self.chunk_scores, self.chunk_indices, self.merge_scores, self.merge_indices, self.attention_scores, self.core, output, self.executions)
-        arguments = QSAArguments(mix, *(tensor.data_ptr() for tensor in tensors), request_tokens.stride(0), request_tokens.shape[0], key.shape[0] * 64, ring.shape[0], self.rotary_cache.shape[0], axes, 0 if axes == 1 else positions.stride(0), key.stride(0), key.stride(1), key.stride(3), value.stride(0), value.stride(1), value.stride(3), self.qsa_lists, self.context_limit)
+        arguments = QSAArguments(mix, *(tensor.data_ptr() for tensor in tensors), request_tokens.stride(0), request_tokens.shape[0], key.shape[0] * 64, ring.shape[0], self.rotary_cache.shape[0], axes, 0 if axes == 1 else positions.stride(0), key.stride(0), key.stride(1), key.stride(3), value.stride(0), value.stride(1), value.stride(3), self.qsa_lists, self.context_limit, 1 if verify else 0)
         with torch.cuda.device(self.device):
             self.program.base.check(self.program.library.flash_qsa(ctypes.byref(arguments), torch.cuda.current_stream(self.device).cuda_stream))
         return output, (hidden, self.mixer.normalized[:rows])

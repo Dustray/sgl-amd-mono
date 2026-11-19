@@ -207,6 +207,50 @@ class _AbortingScheduler:
         return "aborted"
 
 
+@pytest.mark.parametrize("draft,spec_verify,graphed,expected", [
+    # The target of a fused-verify server captures nothing by default, so every TARGET_VERIFY
+    # batch takes the eager path where the mono kernels run.
+    (False, True, False, "skipped"),
+    # With the verify-graph opt-in a GraphExecution is installed on the target, so capture runs
+    # (SGLang captures TARGET_VERIFY, the fused model.forward supplies the mono kernels).
+    (False, True, True, "graph_execution"),
+    # EAGLEDraftCudaGraphRunner inherits DecodeCudaGraphRunner.capture, so the hook fires
+    # for the draft too; it must capture normally (3 of 4 forwards per MTP round).
+    (True, True, False, "original"),
+    (True, False, True, "original"),
+    # Non-spec decode keeps the validated mono decode graph.
+    (False, False, True, "graph_execution"),
+    (False, False, False, "original"),
+])
+def test_target_verify_capture_is_skipped_without_touching_the_draft(monkeypatch, draft, spec_verify, graphed, expected):
+    from types import SimpleNamespace
+
+    from sgl_amd_mono_0518 import flash_next
+
+    calls = []
+    target_model_runner = object()
+    runtime = SimpleNamespace(
+        runner=target_model_runner,
+        spec_verify=spec_verify,
+        graph=SimpleNamespace(capture=lambda original, runner, *a, **k: calls.append("graph_execution")) if graphed else None,
+    )
+    monkeypatch.setattr(flash_next, "_runtime", runtime)
+    runner = SimpleNamespace(model_runner=object() if draft else target_model_runner)
+    flash_next.around_graph_capture(lambda runner, *a, **k: calls.append("original"), runner)
+    assert calls == ([] if expected == "skipped" else [expected])
+
+
+def test_graph_capture_without_a_runtime_is_untouched(monkeypatch):
+    from types import SimpleNamespace
+
+    from sgl_amd_mono_0518 import flash_next
+
+    calls = []
+    monkeypatch.setattr(flash_next, "_runtime", None)
+    flash_next.around_graph_capture(lambda runner, *a, **k: calls.append("original"), SimpleNamespace(model_runner=object()))
+    assert calls == ["original"]
+
+
 def test_beam_coordinator_fix_registered_without_flash_next_env(monkeypatch):
     from collections import defaultdict
 

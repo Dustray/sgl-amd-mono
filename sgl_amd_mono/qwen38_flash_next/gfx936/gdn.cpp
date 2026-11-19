@@ -26,13 +26,32 @@ struct GDNArguments {
     BFloat16* core;
     BFloat16* output;
     int* executions;
+    // Fused MTP verify (requests > 0): per-step conv-window and ssm snapshots in the
+    // speculative scratch, indexed by scratch_rows[request]. Rows are front-packed
+    // request * steps + step, matching the native EAGLE verify layout.
+    BFloat16* conv_window;
+    float* intermediate_ssm;
+    const void* scratch_rows;
     int64_t conv_slot_stride;
     int64_t conv_channel_stride;
     int64_t conv_history_stride;
     int64_t ssm_slot_stride;
     int64_t index_bytes;
     int64_t slot_count;
+    int64_t window_slot_stride;
+    int64_t window_step_stride;
+    int64_t window_dim_stride;
+    int64_t window_win_stride;
+    int64_t intermediate_slot_stride;
+    int64_t intermediate_step_stride;
+    int64_t steps;
+    int64_t requests;
+    int64_t scratch_slots;  // rows in conv_window / intermediate_ssm; scratch_rows is int32
 };
+
+__device__ __forceinline__ int64_t gdn_read_index(const void* table, int64_t index, int64_t bytes) {
+    return bytes == 8 ? static_cast<const int64_t*>(table)[index] : static_cast<const int32_t*>(table)[index];
+}
 
 __device__ __forceinline__ float gdn_prefix_sum(float value) {
     value += __uint_as_float(__builtin_amdgcn_update_dpp(0, __float_as_uint(value), 280, 15, 15, true));
@@ -71,6 +90,7 @@ __global__ __launch_bounds__(Threads, 1) void gdn_attention(GDNArguments args) {
     __shared__ float head_output[Head];
     if (!run_mix(args.mix, 300)) return;
     int rows = args.mix.rows;
+    int requests = (int)args.requests;
     // qkvz (2560 -> 2048, 128 tiles per row) and ba (2560 -> 12, 1 tile per row) share one task
     // space: the ba tile of row r is task rows * 128 + r, so it gets its own wave instead of running
     // after qkvz tile 0 on wave 0 (two plain gemv calls both started at wave 0).
@@ -92,7 +112,44 @@ __global__ __launch_bounds__(Threads, 1) void gdn_attention(GDNArguments args) {
         }
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 310)) return;
-    for (int work = blockIdx.x * Threads + threadIdx.x; work < rows * LocalConv; work += Blocks * Threads) {
+    if (requests > 0) {
+        // Verify: one task per (request, channel) replays the whole chain serially so the
+        // rolling window follows the draft order and every step is snapshotted into the
+        // scratch, like native causal_conv1d verify (window slots hold [t-2, t-1, t]).
+        for (int work = blockIdx.x * Threads + threadIdx.x; work < requests * LocalConv; work += Blocks * Threads) {
+            int request = work / LocalConv;
+            int channel = work % LocalConv;
+            int64_t slot = gdn_read_index(args.indices, request, args.index_bytes);
+            int64_t scratch_row = gdn_read_index(args.scratch_rows, request, 4);
+            if (slot < 0 || slot >= args.slot_count || scratch_row < 0 || scratch_row >= args.scratch_slots) {
+                for (int step = 0; step < (int)args.steps; ++step) args.convolved[(request * (int)args.steps + step) * LocalConv + channel] = BFloat16(0.0f);
+                continue;
+            }
+            BFloat16* history = args.conv_state + slot * args.conv_slot_stride + channel * args.conv_channel_stride;
+            BFloat16 window[3] = {history[0], history[args.conv_history_stride], history[2 * args.conv_history_stride]};
+            for (int step = 0; step < (int)args.steps; ++step) {
+                int row = request * (int)args.steps + step;
+                float current = float(args.projected[row * LocalProjection + channel]);
+                float value = float(window[0]) * float(args.conv_weight[channel * 4]);
+                value = fmaf(float(window[1]), float(args.conv_weight[channel * 4 + 1]), value);
+                value = fmaf(float(window[2]), float(args.conv_weight[channel * 4 + 2]), value);
+                value = fmaf(current, float(args.conv_weight[channel * 4 + 3]), value);
+                args.convolved[row * LocalConv + channel] = BFloat16(value * __builtin_amdgcn_rcpf(1.0f + gdn_exp(-value)));
+                BFloat16* snapshot = args.conv_window + scratch_row * args.window_slot_stride + step * args.window_step_stride + channel * args.window_dim_stride;
+                snapshot[0] = window[1];
+                snapshot[args.window_win_stride] = window[2];
+                snapshot[2 * args.window_win_stride] = BFloat16(current);
+                window[0] = window[1];
+                window[1] = window[2];
+                window[2] = BFloat16(current);
+            }
+            history[0] = window[0];
+            history[args.conv_history_stride] = window[1];
+            history[2 * args.conv_history_stride] = window[2];
+        }
+        if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 314)) return;
+    }
+    for (int work = blockIdx.x * Threads + threadIdx.x; work < (requests > 0 ? 0 : rows * LocalConv); work += Blocks * Threads) {
         int row = work / LocalConv;
         int channel = work % LocalConv;
         int64_t slot = args.index_bytes == 8 ? static_cast<const int64_t*>(args.indices)[row] : static_cast<const int32_t*>(args.indices)[row];
@@ -115,7 +172,93 @@ __global__ __launch_bounds__(Threads, 1) void gdn_attention(GDNArguments args) {
         args.convolved[work] = BFloat16(value * __builtin_amdgcn_rcpf(1.0f + gdn_exp(-value)));
     }
     if (!grid_sync(args.mix.synchronization, args.mix.timeout_ticks, 311)) return;
-    for (int work = blockIdx.x; work < rows * LocalHeads; work += Blocks) {
+    if (requests > 0) {
+        // Verify: one (request, head) task replays the four draft steps serially. Each
+        // step reads the previous snapshot (working ssm for step 0), updates it, stores
+        // the snapshot, and emits that row's gated output. The working ssm is never
+        // written: native verify passes disable_state_update too, and the worker's own
+        // commit scatters the accepted-prefix snapshots back.
+        for (int work = blockIdx.x; work < requests * LocalHeads; work += Blocks) {
+            int request = work / LocalHeads;
+            int value_head = work % LocalHeads;
+            int key_head = value_head / 3;
+            int lane = threadIdx.x & 63;
+            int64_t slot = gdn_read_index(args.indices, request, args.index_bytes);
+            int64_t scratch_row = gdn_read_index(args.scratch_rows, request, 4);
+            if (slot < 0 || slot >= args.slot_count || scratch_row < 0 || scratch_row >= args.scratch_slots) {
+                for (int step = 0; step < (int)args.steps; ++step) {
+                    if (threadIdx.x < Head) {
+                        args.recurrent[(request * (int)args.steps + step) * LocalCore + value_head * Head + threadIdx.x] = BFloat16(0.0f);
+                        args.core[(request * (int)args.steps + step) * LocalCore + value_head * Head + threadIdx.x] = BFloat16(0.0f);
+                    }
+                }
+                __syncthreads();
+                continue;
+            }
+            int64_t working_base = slot * args.ssm_slot_stride + value_head * Head * Head;
+            int64_t scratch_base = scratch_row * args.intermediate_slot_stride + value_head * Head * Head;
+            for (int step = 0; step < (int)args.steps; ++step) {
+                int row = request * (int)args.steps + step;
+                const float* state_in = step == 0 ? args.ssm_state + working_base : args.intermediate_ssm + scratch_base + (step - 1) * args.intermediate_step_stride;
+                float* state_out = args.intermediate_ssm + scratch_base + step * args.intermediate_step_stride;
+                if (threadIdx.x < 64) {
+                    int channel = lane * 2;
+                    float query_first = float(args.convolved[row * LocalConv + key_head * Head + channel]);
+                    float query_second = float(args.convolved[row * LocalConv + key_head * Head + channel + 1]);
+                    float key_first = float(args.convolved[row * LocalConv + LocalKey + key_head * Head + channel]);
+                    float key_second = float(args.convolved[row * LocalConv + LocalKey + key_head * Head + channel + 1]);
+                    float query_inverse = __builtin_amdgcn_rsqf(gdn_prefix_sum(query_first * query_first + query_second * query_second) + 1.0e-6f);
+                    float key_inverse = __builtin_amdgcn_rsqf(gdn_prefix_sum(key_first * key_first + key_second * key_second) + 1.0e-6f);
+                    query[channel] = query_first * query_inverse;
+                    query[channel + 1] = query_second * query_inverse;
+                    key[channel] = key_first * key_inverse;
+                    key[channel + 1] = key_second * key_inverse;
+                }
+                __syncthreads();
+                float gate_input = float(args.projected_ba[row * 12 + LocalHeads + value_head]) + float(args.dt_bias[value_head]);
+                float decay = gdn_exp(-gdn_exp(args.a_log[value_head]) * gdn_softplus(gate_input));
+                float beta = 1.0f / (1.0f + gdn_exp(-float(args.projected_ba[row * 12 + value_head])));
+                int key_start = (threadIdx.x & 31) * 4;
+                for (int value_index = threadIdx.x / 32; value_index < Head; value_index += Threads / 32) {
+                    int64_t offset = value_index * Head + key_start;
+                    float state[4], products[4];
+                    for (int element = 0; element < 4; ++element) {
+                        state[element] = state_in[offset + element] * decay;
+                        products[element] = state[element] * key[key_start + element];
+                    }
+                    float prediction = gdn_half_sum(((products[0] + products[1]) + products[2]) + products[3]);
+                    float value = float(args.convolved[row * LocalConv + 2 * LocalKey + value_head * Head + value_index]);
+                    float delta = (value - prediction) * beta;
+                    for (int element = 0; element < 4; ++element) {
+                        state[element] = fmaf(delta, key[key_start + element], state[element]);
+                        state_out[offset + element] = state[element];
+                        products[element] = state[element] * query[key_start + element];
+                    }
+                    float result = gdn_half_sum(((products[0] + products[1]) + products[2]) + products[3]) * 0.08838834764831845f;
+                    if ((threadIdx.x & 31) == 0) {
+                        BFloat16 recurrent = BFloat16(result);
+                        args.recurrent[row * LocalCore + value_head * Head + value_index] = recurrent;
+                        head_output[value_index] = float(recurrent);
+                    }
+                }
+                __syncthreads();
+                if (threadIdx.x < 64) {
+                    int start = threadIdx.x * 2;
+                    float variance = gdn_prefix_sum(head_output[start] * head_output[start] + head_output[start + 1] * head_output[start + 1]);
+                    float inverse = __builtin_amdgcn_rsqf(variance / Head + 1.0e-6f);
+                    for (int element = 0; element < 2; ++element) {
+                        int channel = start + element;
+                        float z = float(args.projected[row * LocalProjection + LocalConv + value_head * Head + channel]);
+                        float gate = 1.0f / (1.0f + gdn_exp(-z));
+                        args.core[row * LocalCore + value_head * Head + channel] = BFloat16(head_output[channel] * inverse * float(args.gated_weight[channel]) * gate);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+    // Decode: one row per request, state updated in place (skipped by verify above).
+    for (int work = blockIdx.x; work < (requests > 0 ? 0 : rows * LocalHeads); work += Blocks) {
         int row = work / LocalHeads;
         int value_head = work % LocalHeads;
         int key_head = value_head / 3;
@@ -204,6 +347,7 @@ extern "C" int flash_gdn_info(int64_t* result) {
 
 extern "C" int flash_gdn(GDNArguments* args, void* stream) {
     if (args->mix.rows < 1 || args->mix.rows > MaxRows || args->slot_count < 1 || (args->index_bytes != 4 && args->index_bytes != 8)) return hipErrorInvalidValue;
+    if (args->requests > 0 && (args->steps < 1 || args->requests * args->steps != args->mix.rows || args->scratch_slots < 1)) return hipErrorInvalidValue;
     void* arguments[] = {args};
     return launch_cooperative(reinterpret_cast<const void*>(gdn_attention), arguments, stream);
 }

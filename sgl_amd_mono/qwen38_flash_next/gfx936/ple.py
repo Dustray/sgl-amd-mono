@@ -7,6 +7,7 @@ import subprocess
 
 import torch
 
+from .geometry import MAX_ROWS
 from .program import FlashContractError, HIPProgram, SyncArguments, require_tensor
 
 
@@ -77,9 +78,9 @@ class PLE:
             require_tensor(tensor, shape, torch.int64 if index < 3 else torch.bfloat16, self.device)
         if embedding.ngram_size != 3 or embedding.heads_per_ngram != 8 or layer.short_conv_dilation != 3 or layer.short_conv_state_len != 9 or embedding.gather_dp_tokens:
             raise FlashContractError("PLE hash, state, or parallel layout differs")
-        self.local_embedding = torch.empty((2, 2560), dtype=torch.bfloat16, device=self.device)
+        self.local_embedding = torch.empty((MAX_ROWS, 2560), dtype=torch.bfloat16, device=self.device)
         self.embedding = torch.empty_like(self.local_embedding)
-        self.key = torch.empty((2, 10240), dtype=torch.bfloat16, device=self.device)
+        self.key = torch.empty((MAX_ROWS, 10240), dtype=torch.bfloat16, device=self.device)
         self.value = torch.empty_like(self.embedding)
         self.normalized_key = torch.empty_like(self.key)
         self.normalized_query = torch.empty_like(self.key)
@@ -89,8 +90,8 @@ class PLE:
 
     def __call__(self, hidden, contexts, state_indices, conv_state):
         rows = hidden.shape[0]
-        if rows not in (1, 2):
-            raise FlashContractError("PLE decode supports one or two rows")
+        if not 1 <= rows <= MAX_ROWS:
+            raise FlashContractError(f"PLE decode supports up to {MAX_ROWS} rows")
         require_tensor(hidden, (rows, 10240), device=self.device)
         require_tensor(contexts, (rows, 3), torch.int64, self.device)
         require_tensor(state_indices, (rows,), torch.int64, self.device)

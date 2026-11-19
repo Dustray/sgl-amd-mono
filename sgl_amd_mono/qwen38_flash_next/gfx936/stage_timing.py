@@ -52,7 +52,7 @@ SEGMENTS = {
              50: "moe.publish", 51: "moe.exchange", 53: "moe.reduce", 54: "moe.peer wait",
              60: "inject.gate", 61: "inject.add"},
     "gdn": {300: "mix.normalize", 301: "mix.down", 302: "mix.up", 303: "mix.branch",
-            310: "qkvz+ba gemv", 311: "conv state", 312: "recurrent", 313: "output gemv"},
+            310: "qkvz+ba gemv", 311: "conv state", 312: "recurrent", 313: "output gemv", 314: "verify conv snapshots"},
     "qsa": {400: "validate", 401: "mix.normalize", 402: "mix.down", 403: "mix.up", 404: "mix.branch",
             405: "qkv+index gemv", 406: "norm+rope+kv", 408: "index compress", 409: "index scores",
             410: "top512 select", 411: "attn scores", 412: "softmax+attn", 413: "output gemv",

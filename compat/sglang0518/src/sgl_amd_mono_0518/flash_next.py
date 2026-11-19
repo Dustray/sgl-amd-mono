@@ -28,14 +28,41 @@ def after_initialize(result, runner):
 
         logger.warning("AMD_FLASH_ACCURACY_REFERENCE %s", install())
     if os.environ.get("SGLANG_AMD_FLASH_NEXT_0518", "0") == "1":
-        from sgl_amd_mono.qwen38_flash_next.gfx936.runner import FlashRuntime
+        from sgl_amd_mono.qwen38_flash_next.gfx936 import contract
 
-        _runtime = FlashRuntime(runner)
-        if getattr(runner.server_args, "cuda_graph_backend_decode", None) == "full":
+        spec = contract.spec_enabled(runner.server_args)
+        # This hook also runs on the draft worker's ModelRunner. Without the fused
+        # verify env the whole server (target and draft) stays native (P0); with it,
+        # only the target runner installs the runtime and its verify batches (4 fused
+        # rows per request) go through the mono kernels while the draft stays native.
+        fused_target = spec and contract.spec_fused_requested() and not getattr(runner, "is_draft_worker", False)
+        if spec:
+            logger.warning(
+                "AMD_FLASH_TP8 speculative=%s fused_verify=%s draft=%s route=%s verify_graph=%s",
+                contract.spec_algorithm_name(runner.server_args.speculative_algorithm),
+                contract.spec_fused_requested(),
+                bool(getattr(runner, "is_draft_worker", False)),
+                "gfx936_tp8_bf16_verify" if fused_target else "sglang_original",
+                contract.spec_verify_graph_policy(getattr(runner.server_args, "cuda_graph_backend_decode", None), contract.spec_verify_graph_requested()) if fused_target else "n/a",
+            )
+        if not spec or fused_target:
+            from sgl_amd_mono.qwen38_flash_next.gfx936.runner import FlashRuntime
+
+            _runtime = FlashRuntime(runner)
             from sgl_amd_mono.qwen38_flash_next.gfx936.graph import GraphExecution
 
-            _runtime.graph = GraphExecution(_runtime)
-        apply_benchmark_mode(_runtime, None)
+            if not spec and getattr(runner.server_args, "cuda_graph_backend_decode", None) == "full":
+                _runtime.graph = GraphExecution(_runtime)
+            elif fused_target and contract.spec_verify_graph_enabled(runner.server_args):
+                # Opt-in (SGLANG_AMD_FLASH_SPEC_VERIFY_GRAPH=1): capture the fused
+                # TARGET_VERIFY batch into the target decode graph. SGLang's own
+                # DecodeCudaGraphRunner captures TARGET_VERIFY (bs x DRAFT_TOKENS rows);
+                # the mono kernels run because the target's fused model.forward executes
+                # under capture. GraphExecution.execute validates the first replay
+                # bit-for-bit against eager mono. With the flag off the target captures
+                # nothing (see around_graph_capture) and verify stays eager.
+                _runtime.graph = GraphExecution(_runtime)
+            apply_benchmark_mode(_runtime, None)
     if os.environ.get("SGLANG_AMD_FLASH_ACCURACY_TRACE_DIR"):
         from sgl_amd_mono.qwen38_flash_next.gfx936.accuracy_trace import AccuracyTrace
 
@@ -82,8 +109,22 @@ def after_internal_state(result, scheduler, request):
 
 
 def around_graph_capture(original, runner, *args, **kwargs):
-    if _runtime is not None and _runtime.graph is not None and runner.model_runner is _runtime.runner:
+    # EAGLEDraftCudaGraphRunner inherits this method, so the hook also fires for the
+    # draft worker's runners; they carry their own model_runner and must capture
+    # normally -- the three draft forwards of an MTP round are where the graph pays off.
+    own = _runtime is not None and getattr(runner, "model_runner", None) is _runtime.runner
+    if own and _runtime.graph is not None:
+        # Non-spec full decode, or a fused-verify target that opted into verify-graph
+        # capture: run SGLang's capture (the fused model.forward provides the mono kernels)
+        # and install the graph/eager check in GraphExecution.capture.
         return _runtime.graph.capture(original, runner, *args, **kwargs)
+    if own and _runtime.spec_verify:
+        # Fused verify without the verify-graph opt-in: capture nothing on the target.
+        # FullCudaGraphBackend.can_run is `shape_key in self._graphs`, so an empty graph
+        # set sends every verify batch down the eager path, which is where the mono
+        # kernels run. The draft worker (own=False) still captures its graphs below.
+        logger.warning("AMD_FLASH_TP8 skipping target decode-graph capture; TARGET_VERIFY runs eager through the fused kernels")
+        return None
     return original(runner, *args, **kwargs)
 
 

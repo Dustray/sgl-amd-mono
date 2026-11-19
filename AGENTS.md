@@ -21,6 +21,14 @@ upstream gfx950 models are out of scope unless the user asks.
   helper is `sgl_amd_mono/common/gpus.py`.
 - SGLang `0.5.18+dtk2604…` (installed under `/usr/local/lib/python3.10/dist-packages/sglang`, do not
   edit it), Torch `2.11.0+dtk2604`, DTK HIP compiler at `/opt/dtk/bin/hipcc`.
+  **This install is no longer pristine (noticed 2026-11-19).** `srt/layers/attention/qwen_sparse_attn_backend.py`
+  was edited in place on 2026-11-19 08:23 (89546 → 89764 bytes; every other file in that directory still has the
+  2026-09-21 install mtime), and `native_sources.json` was repinned from `e889f26a…` to `da3a76ac…` to match.
+  `e889f26a…` is the hash pip recorded at install time, so the old pin was the shipped file and the new pin only
+  exists on this machine: `tools/source_status.py --verify` passes here but will fail on a clean install, and
+  anything that depends on the edit will not reproduce there. The original is not recoverable locally (no wheel
+  in the pip cache), so the edit is undocumented. Prefer working around SGLang bugs in the plugin, as commit
+  `a9ecb7e` did, and if the install must be patched, keep the patch in the repo.
 - Model: `/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-Flash-Next/snapshots/master`
   (≈335 GiB BF16, 48 layers = 36 GDN + 12 QSA, 512 experts top-10, HC, PLE). Loading takes ~4–5 min.
 - Git branch `local/sglang-0.5.18-gfx936`; upstream base pinned in `UPSTREAM.lock.json`.
@@ -42,7 +50,7 @@ upstream gfx950 models are out of scope unless the user asks.
 | `sgl_amd_mono/common/profiling.py`, `profile_trace.py` | Profile range markers (`SGLANG_AMD_PROFILE_RANGES=1`) and the 8-rank Perfetto merge. `merge_profiles(..., mono_only=True)` (CLI: `--mono-only` / `--profile-mono-only`) validates on the full traces but exports only fused kernels, device stages, `inference/` step markers and `mono/` ranges → `inference.mono_only.json.gz`, ~1% of the events (b1 512→64: 313 MB → 2.3 MB); host/frontend/client events dropped |
 | `tools/profile_flash_next_serving.py` | Standalone profile capture (`--mode native|monokernel`, `--decode-graph`): torch profiler → merged Perfetto, or `--hipprof` for a HIP-level `.pftrace` |
 | `tools/summarize_serving_profile.py`, `tools/validate_serving_profile.py`, `tools/profile_queries.sql` | Re-merge raw rank traces; validate a merged trace with Perfetto trace processor (`/tmp/monokernel-perfetto/linux-amd64/trace_processor_shell`, may need re-download) |
-| `tools/verify_flash_next_{gdn,qsa,ple,io,hc,moe,tp8}.py` | Per-module real-weight checks |
+| `tools/verify_flash_next_{gdn,qsa,ple,io,hc,moe,tp8}.py` | Per-module real-weight checks; `verify_flash_next_gdn.py --verify` also covers the fused MTP verify branch |
 | `tools/verify_flash_next_cu_timing.py` | Device check for the per-CU marks: runs `hc_mix` on one GPU (no model) and verifies CU placement, mark order and drops |
 | `tools/verify_flash_next_{serving,correctness,batch_accuracy,default_accuracy}.py`, `run_flash_next_accuracy_matrix.py`, `diagnose_flash_next_*` | Accuracy acceptance and diagnosis (still failing, see below) |
 | `tools/source_status.py --verify` | Checks pinned SGLang interface files |
@@ -75,7 +83,8 @@ Metric definitions used by the script (keep them when comparing to old data):
 
 ## Mono constraints (enforced by `contract.py` / `graph.py`)
 
-- BF16 weights and KV, Triton attention + MoE, page 64, context ≤ 262144, decode batch 1 or 2,
+- BF16 weights and KV, Triton attention + MoE, page 64, context ≤ 262144, decode batch 1 or 2 (a fused MTP
+  verify batch is `DRAFT_TOKENS` rows per request, so up to `MAX_ROWS` = 8 rows),
   overlap schedule and radix cache off, PLE embedding on GPU. Prefill always runs native SGLang.
 - **Long context (2026-11-17).** The QSA index top-k was one 1024-wide bitonic sort, which capped the
   context at 4096. It now sorts the 4-token groups in chunks of 1024 (one block per chunk) and merges
@@ -131,7 +140,9 @@ Important environment variables:
 | `SGLANG_AMD_FLASH_REPORT_DIR` | Per-run dir for `rank-*.json` and the kernel codegen cache |
 | `SGLANG_AMD_FLASH_STAGE_TIMING=1`, `_STEP`, `_STEPS`, `_RECORDS` | Block-0 device stage timing: enable, first decode step to export, step count, buffer records |
 | `SGLANG_AMD_FLASH_CU_TIMING=1`, `_RECORDS` | Per-CU device timing (one row per compute unit); uses the same `_STEP`/`_STEPS` |
-| `SGLANG_AMD_FLASH_SHADOW_STEPS` / `_REARM_ON_PREFILL=0` | Shadow (native reference) checks per batch size; `REARM=0` keeps them out of timed requests |
+| `SGLANG_AMD_FLASH_SPEC_VERIFY=1` | Route MTP TARGET_VERIFY batches through the mono kernels. **Without it a speculative server installs no runtime at all** — draft and target are both plain native |
+| `SGLANG_AMD_FLASH_SPEC_VERIFY_GRAPH=1` | Opt-in, on top of `_SPEC_VERIFY=1`: capture the fused TARGET_VERIFY batch into the target decode graph (SGLang-native TARGET_VERIFY capture, bs x DRAFT_TOKENS rows) instead of running it eager. The first replay is validated bit-for-bit against eager mono and fails the launch if SGLang's replay does not refresh every mono input. Default off = validated eager verify |
+| `SGLANG_AMD_FLASH_SHADOW_STEPS` / `_REARM_ON_PREFILL=0` | Shadow (native reference) checks per batch size (verify batches count separately from decode); `REARM=0` keeps them out of timed requests |
 | `SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES=1` | Record shadow accuracy failures and keep serving (needed for any perf run today) |
 | `SGLANG_AMD_FLASH_ACCURACY_REFERENCE=1` | Deterministic reference policy for accuracy work only; never for perf |
 | `SGLANG_AMD_PROFILE_RANGES=1`, `SGLANG_AMD_PROFILE_EVENT_DIR` | Install profile markers / frontend event capture |
@@ -173,7 +184,7 @@ python3 tools/merge_flash_next_stage_timing.py --run-dir <run>/runtime   # 8 ran
 ```
 
 - `stage_mark()` lives in `kernel.cpp` next to `grid_sync`; kernel-entry markers are 700-706 and
-  barrier stage numbers are disjoint per kernel kind (hc_mix 1-4, post 10-61, gdn 300-313,
+  barrier stage numbers are disjoint per kernel kind (hc_mix 1-4, post 10-61, gdn 300-314 (314 = MTP verify conv snapshots),
   qsa 400-413, ple 500-524, entry 600-620, tail 630-644).
   Names live in `stage_timing.py:SEGMENTS`; add a name there when you add a barrier.
 - Buffer layout: `[0]` cursor, `[1]` dropped flag, then `(stage, ticks)` pairs. Attach happens per
@@ -269,6 +280,126 @@ python3 tools/profile_flash_next_serving.py --mode monokernel --cu-stages --outp
 
 - Mono decode runs end to end, with and without decode graph. Graph vs. eager mono is bit-identical
   on the first real request (logits and all 48 layers' caches) on all ranks.
+- **Fused MTP verify is in progress (2026-11-19, uncommitted).** `contract.py` accepts only
+  the pinned EAGLE/NEXTN geometry (topk 1, steps 3, draft tokens 4); without `SGLANG_AMD_FLASH_SPEC_VERIFY=1`
+  a speculative server installs no runtime and decodes fully natively — so a "monokernel + MTP" run with the
+  env unset measures plain native SGLang, mono contributes nothing. `launch_qwen_flash_next_api_monokernel.sh`
+  therefore defaults it to 1. With it, only the target runner installs the runtime and its TARGET_VERIFY
+  batches (`DRAFT_TOKENS` fused rows per request) run on the mono kernels, while the draft stays native.
+  `MaxRows` is now 8 (`geometry.py`), so decode buffers grew with it.
+  - **Keep `--cuda-graph-backend-decode full` with fused verify.** By default a verify batch is not
+    graph-captured (verify runs eager), but `disabled` is the wrong way to express that: SGLang builds the
+    *draft* worker's graph runners from the same flag (`_capture_cuda_graphs` returns early on `disabled`), and
+    an MTP round is 3 draft forwards plus 1 verify forward. At `full` the plugin by default skips capture on the
+    target runner only (`around_graph_capture`); `FullCudaGraphBackend.can_run` is `shape_key in self._graphs`,
+    so an empty graph set sends verify down the eager path where the mono kernels run, and the draft keeps its
+    graphs. `contract.spec_verify_graph_policy` reports which of the two a launch picked, and the choice shows
+    up in `/server_info` and the `AMD_FLASH_TP8 speculative=` startup line. With `--cuda-graph-backend-decode
+    full` and the opt-in `SGLANG_AMD_FLASH_SPEC_VERIFY_GRAPH=1` the target instead installs a `GraphExecution`
+    and captures the verify batch (see the next bullet).
+  - **Verify-graph capture works on device (validated 2026-11-19, behind
+    `SGLANG_AMD_FLASH_SPEC_VERIFY_GRAPH=1`, default off).** The key finding: SGLang 0.5.18+dtk2604
+    `DecodeCudaGraphRunner` captures TARGET_VERIFY natively — for a spec target it sets
+    `capture_forward_mode=TARGET_VERIFY` and a `bs x captured_req_width(=DRAFT_TOKENS=4)` shape, and
+    `can_run_graph` only needs `spec_info.num_tokens_per_req == 4` plus the shape in `_graphs`. So the
+    capture/replay/static-buffer-refresh machinery was already there; the plugin only had to stop skipping
+    it. The change: `flash_next.after_initialize` installs `GraphExecution` on the fused target when the flag
+    is on and `full`; `around_graph_capture` now prefers `_runtime.graph.capture` (run SGLang capture, the
+    fused `model.forward` supplies the mono kernels under capture) and falls back to the old "skip, verify runs
+    eager" only when no graph was installed; `around_graph_execute` routes the replay through
+    `GraphExecution.execute`, which for a verify batch calls `_decode_states(batch)` (so the compared state set
+    includes the per-draft GDN scratch + PLE side states) and, on the first replay per shape, runs
+    `GraphExecution._validate` with `native_shadow=True` — that forces the eager reference through the same
+    fatal per-module native-vs-mono shadow (incl. the bf16-ULP gate) AND requires graph-vs-eager-mono logits
+    and states to be bit-equal, so a mismatch fails the launch loudly and never serves silently. The eager
+    reference pass doubles as the per-module verify shadow that would otherwise never run once verify goes
+    through a graph (coverage preserved).
+    - The two runtime unknowns both cleared on the first device run (2026-11-19): (1) the target replay's
+      `attn_backend.init_forward_metadata_out_graph(fb_view)` in TARGET_VERIFY mode DOES refresh
+      `forward_metadata.mamba_cache_indices` in the captured tensor each replay; (2) the PLE verify branch's
+      buffers are all in the replay-time static set. `verify_intermediate_state_indices` is a constant `arange`
+      built once in `GDNAttnBackend.__init__` (verified); pools/scratch/`req_to_token` are static; QSA verify uses
+      the device-chosen chunk count + epoch `grid_sync`, already proven capture-safe by growing-length replay.
+    - To try it: `SGLANG_AMD_FLASH_SPEC_VERIFY_GRAPH=1 bash launch_qwen_flash_next_api_monokernel.sh`
+      (needs `--cuda-graph-backend-decode full`, which the launcher already sets). Offline unit tests for the
+      reordered `around_graph_capture` and the `_validate` verify `native_shadow` path are in
+      `test/unit/test_qwen38_flash_next_graph.py` / `test_sglang0518_compat.py` (pure CPU, run masked green).
+    - **Device run (2026-11-19, 200k server, b1): first TARGET_VERIFY replay is bit-equal and it is a clear win at
+      long context.** All 8 ranks: `route=gfx936_tp8_bf16_verify verify_graph=verify captured into the target
+      graph, draft graphs kept`; `AMD_FLASH_GRAPH_CAPTURE batch_sizes=[1]`; `cuda_graph={... target_verify=2.03,
+      draft_decode=2.49, draft_extend=2.22}`. On all 8 ranks `AMD_FLASH_GRAPH_EAGER_CHECK` reported
+      `{rows:1, logits:{nrmse:0.0, max_absolute_error:0.0}, state_match:...}` on the first verify replay (graph
+      replay bit-equal to eager mono — logits AND GDN/PLE/conv states), and the server reached "ready to roll"
+      rather than failing `_validate` at startup, so both unknowns above are confirmed refreshed correctly. The
+      only logged shadow failure is the known non-fatal full-model logits one (nrmse 0.1089, byte-identical across
+      all 8 ranks = reference jitter, self-downgrading, server stays up). Steady decode (ignoring the post-prefill
+      first-batch dips of 1.95/9.71/6.93/3.46 tok/s): ~28-41 tok/s at 75-85k context (accept len 2.25-3.38, accept
+      rate 0.42-0.79), vs. pre-verify-graph eager-verify ~20 tok/s at ~73k — bigger than the predicted 5-6% because
+      verify is where long-context cost concentrates, so graphing it strips fixed per-step overhead that dominates
+      there. Perf only: full accuracy acceptance vs. native (below) is still the open gate.
+  - GDN verify replays the chain per request: conv advances the working window and snapshots each step, the
+    recurrent state stays in registers with per-step snapshots and the working ssm is never written (native
+    does the same with `disable_state_update`); the worker's commit scatters the accepted prefix back.
+  - Device-validated 2026-11-19: `python3 tools/verify_flash_next_gdn.py --verify` (layers 0/1/46, ranks 0/7,
+    1 and 2 requests, 12 checks, real BF16 shards, eager). Reference is `DRAFT_TOKENS` serial decode steps on a
+    copy of the state — one verify row is one decode step, so after step j the working conv state *is* that
+    step's window snapshot and the working ssm *is* that step's ssm snapshot. Worst nrmse: output 2.1e-3,
+    ssm snapshots 6.1e-4, conv window 2.2e-5; the working ssm, the unused scratch rows and the unwritten
+    scratch bytes compare bit-identical. Index tables are deliberately non-identity and a negative control
+    confirmed the snapshot checks are discriminative (wrong request or wrong step order scores nrmse ~1.4,
+    vs. a 0.006 gate).
+  - **Second serving run (2026-11-19) cleared every per-module check: 98/98.** Including the four
+    GDN layers whose nrmse sat above the old gate (29/30/37 at 0.0061-0.0069, 44 at 0.0111) but
+    whose peak-scale ULP was 0.5-1.25 — layer 44 has the worst nrmse in the run *and* the best
+    ULP (0.5), which is the clearest demonstration that the two axes are independent.
+  - **The full-model logits gate (KL <= 0.01, TV <= 0.05, argmax equal) is not reachable by
+    anything on this model, so it now downgrades itself.** On that same verify batch the shadow
+    re-ran native three times from the restored state: native against itself scored KL 0.02118 /
+    TV 0.085 on row 2, i.e. **the reference misses the gate it is used to judge** (native HC mix
+    sums split-K with FP32 atomics — the expert-flip already documented below). mono scored KL
+    0.02234 / TV 0.0822 on the same rows, inside native's own spread, and its single argmax flip
+    (row 1) is an exact bf16 tie: logit[271] == logit[561] == 14.9375, top-2 margin 0.0, where
+    `argmax` returns the lower index. Per-row, mono is 1.7-9.7x native's self-noise, so mono is
+    *not* bit-equal to native — but this comparison cannot separate that from reference jitter.
+    `_full_model_shadow` therefore scores native's own repeats through the same gate and passes
+    `discriminating=all(...)` to `_shadow_failure`: the check records and keeps serving only when
+    the reference failed too, and stays fatal when native does reproduce. Per-module checks are
+    unaffected and still fatal by default; `SGLANG_AMD_FLASH_SHADOW_RECORD_FAILURES=1` keeps its
+    documented meaning of downgrading everything.
+  - Not yet done: a perf number, and an accuracy statement that survives a reproducible
+    reference. The GDN layer shadow saves, compares and restores the per-step scratch, because
+    the native rerun inside the shadow overwrites exactly the buffers mono's verify produces —
+    without that the shadow silently graded native against itself.
+  - **First real serving run (2026-11-19, rank 6).** `forward_keys` reached
+    `[["EXTEND", 1, false], ["TARGET_VERIFY", 1, true]]`, i.e. mono really ran the verify batch.
+    Everything passed with margin except one check: QSA verify layers 3/7 bit-identical to native
+    and 11/15 at nrmse 0.0012/0.0015 (gate 0.008); post-attention (HC/MoE at 4 rows) worst 0.0007;
+    conv-window snapshots and the working conv state bit-identical. GDN output nrmse crept 0.0033
+    (layer 0) to 0.0061 (layer 16) and tripped the 0.006 gate there.
+  - **That trip was the metric, not the kernel — the GDN verify output is now gated on nrmse OR
+    bf16 ULPs at the tensor peak** (`bf16_ulp_error`, tolerance `DRAFT_TOKENS`). Evidence from the
+    saved dump: 70% of elements differ, but the elementwise relative error is bimodal — elements
+    at |v| >= 0.05 sit at 0.5 ULP (correct rounding) while the 1110 elements below 1e-3 reach
+    15843 ULP. Absolute error is capped at 4.9e-4 tensor-wide, exactly half a ULP at the peak of
+    0.136, so this is cancellation in near-zero elements, and nrmse reads high only because it
+    normalises by an RMS (0.0116) that those elements drag down. Two earlier hypotheses were
+    checked and **disproved** by the per-row split: there is no accumulation along the draft chain
+    (row 0 0.0061, row 3 0.0050), and the depth trend is not growing absolute error (layer 1 has
+    the largest max_abs, 4.9e-3, at one of the lowest nrmse). Under the new gate the real dump
+    scores 0.5 ULP (pass) while a single element perturbed by the tensor peak scores 138.8 (fail).
+    Decode keeps the plain nrmse gate; only the verify output carries `bf16_ulp`.
+  - **ULP tolerance is 16, not `DRAFT_TOKENS` (2026-11-19).** The next serving run died at the very first verify
+    batch on GDN layer 32 (rank 3, nrmse 0.0113, 6 ULP at a peak of 0.0615, fatal because the full-model
+    reference repeated cleanly that time). Rebuilding the whole verify chain off the checkpoint on CPU
+    (bf16 in_proj, conv+silu, exp/softplus gating, l2norm, fp32 delta recurrence, sigmoid(z) norm) produced
+    a `recurrent` buffer **bit-identical to mono's** and <= 1.3 ULP in `core`, so the kernel is the exact
+    chain and the 6 ULP is the reference side's rounding: native verify runs the aiter Triton kernel with its
+    own fp32 accumulation orders, plus native GEMMs and a differently-ordered 8-way bf16 all-reduce. The
+    per-element diff is diffuse noise (86% of elements differ, mean ~0), and peak-scaled ULP divides by the
+    layer's peak, so the same ~1.5e-3 absolute floor is 0.5 ULP at layer 16's peak 0.136 and 6 ULP at
+    layer 32's peak 0.0615. 16 keeps ~2.7x headroom over the worst observed dump while real divergences
+    stay orders above (flipped step ~nrmse 1.4, flipped expert ~0.2, mis-indexed row moves whole 128-wide
+    head blocks). Updated test: `test_gdn_shadow_gate_combines_nrmse_and_ulp` includes the layer-32 dump.
 - **Full accuracy acceptance vs. native still fails.** Gate per decode row: logits finite, `KL(P_native‖P_mono) ≤ 0.01`,
   `TV ≤ 0.05`, greedy argmax equal (raw NRMSE is reported only). 2026-11-06 matrix (b1: 64/512/2048/3072→64,
   b2: 64/512/1536→64, 472 fused forwards): all 7 combos fail; 13/13 short exact-answer prompts match native.

@@ -8,6 +8,8 @@ import subprocess
 
 import torch
 
+from .geometry import MAX_ROWS
+
 
 class FlashContractError(RuntimeError):
     pass
@@ -193,17 +195,17 @@ class HCMix:
             require_tensor(tensor, shape, device=self.device)
         self.weights = (norm_weight, down, up)
         self.program = HIPProgram.get(self.device)
-        self.normalized = torch.empty((2, 10240), dtype=torch.bfloat16, device=self.device)
-        self.lowrank = torch.empty((2, 320), dtype=torch.bfloat16, device=self.device)
-        self.gates = torch.empty((2, 10240), dtype=torch.float32, device=self.device)
-        self.partials = torch.empty((2, 40, 320), dtype=torch.float32, device=self.device)  # mix.down split-K chunks
+        self.normalized = torch.empty((MAX_ROWS, 10240), dtype=torch.bfloat16, device=self.device)
+        self.lowrank = torch.empty((MAX_ROWS, 320), dtype=torch.bfloat16, device=self.device)
+        self.gates = torch.empty((MAX_ROWS, 10240), dtype=torch.float32, device=self.device)
+        self.partials = torch.empty((MAX_ROWS, 40, 320), dtype=torch.float32, device=self.device)  # mix.down split-K chunks
         self.state = torch.zeros(4, dtype=torch.int32, device=self.device)
         self.executions = torch.zeros(1, dtype=torch.int32, device=self.device)
 
     def __call__(self, hidden):
         rows = hidden.shape[0]
-        if rows not in (1, 2):
-            raise FlashContractError("Flash-Next HC mix supports one or two decode rows")
+        if not 1 <= rows <= MAX_ROWS:
+            raise FlashContractError("Flash-Next HC mix supports up to MAX_ROWS decode or verify rows")
         require_tensor(hidden, (rows, 10240), device=self.device)
         output = torch.empty((rows, 2560), dtype=torch.bfloat16, device=self.device)
         tensors = (hidden, *self.weights, self.normalized, self.lowrank, self.gates, self.partials, output, self.state, self.executions)
@@ -240,22 +242,22 @@ class PostAttention:
         for tensor, shape in zip(self.weights, shapes):
             require_tensor(tensor, shape, device=self.device)
         specifications = (
-            ("reduced_attention", (2, 2560), torch.bfloat16),
-            ("post_attention", (2, 10240), torch.bfloat16),
-            ("normalized", (2, 10240), torch.bfloat16),
-            ("lowrank", (2, 320), torch.bfloat16),
-            ("gates", (2, 10240), torch.float32),
-            ("partials", (2, 40, 320), torch.float32),
-            ("mixed", (2, 2560), torch.bfloat16),
-            ("router_logits", (2, 512), torch.bfloat16),
-            ("top_ids", (2, 10), torch.int32),
-            ("top_weights", (2, 10), torch.float32),
-            ("inject_gates", (2, 5), torch.float32),
-            ("projected", (2, 11, 160), torch.bfloat16),
-            ("activated", (2, 11, 80), torch.bfloat16),
-            ("expert_output", (2, 11, 2560), torch.bfloat16),
-            ("local_moe", (2, 2560), torch.bfloat16),
-            ("reduced_moe", (2, 2560), torch.bfloat16),
+            ("reduced_attention", (MAX_ROWS, 2560), torch.bfloat16),
+            ("post_attention", (MAX_ROWS, 10240), torch.bfloat16),
+            ("normalized", (MAX_ROWS, 10240), torch.bfloat16),
+            ("lowrank", (MAX_ROWS, 320), torch.bfloat16),
+            ("gates", (MAX_ROWS, 10240), torch.float32),
+            ("partials", (MAX_ROWS, 40, 320), torch.float32),
+            ("mixed", (MAX_ROWS, 2560), torch.bfloat16),
+            ("router_logits", (MAX_ROWS, 512), torch.bfloat16),
+            ("top_ids", (MAX_ROWS, 10), torch.int32),
+            ("top_weights", (MAX_ROWS, 10), torch.float32),
+            ("inject_gates", (MAX_ROWS, 5), torch.float32),
+            ("projected", (MAX_ROWS, 11, 160), torch.bfloat16),
+            ("activated", (MAX_ROWS, 11, 80), torch.bfloat16),
+            ("expert_output", (MAX_ROWS, 11, 2560), torch.bfloat16),
+            ("local_moe", (MAX_ROWS, 2560), torch.bfloat16),
+            ("reduced_moe", (MAX_ROWS, 2560), torch.bfloat16),
         )
         self.buffers = []
         for name, shape, dtype in specifications:
@@ -267,8 +269,8 @@ class PostAttention:
     def __call__(self, attention, residuals):
         hidden, normalized = residuals
         rows = attention.shape[0]
-        if rows not in (1, 2):
-            raise FlashContractError("Flash-Next post-attention supports one or two decode rows")
+        if not 1 <= rows <= MAX_ROWS:
+            raise FlashContractError("Flash-Next post-attention supports up to MAX_ROWS decode or verify rows")
         for tensor, shape in ((attention, (rows, 2560)), (hidden, (rows, 10240)), (normalized, (rows, 10240))):
             require_tensor(tensor, shape, device=self.device)
         output = torch.empty((rows, 10240), dtype=torch.bfloat16, device=self.device)

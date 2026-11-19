@@ -17,7 +17,9 @@ constexpr int Intermediate = 80;
 constexpr int Ranks = 8;
 constexpr int Blocks = 80;
 constexpr int Threads = 256;
-constexpr int MaxRows = 2;
+// Decode uses one row per request; a TARGET_VERIFY pass uses DraftTokens rows per
+// request (see geometry.py), so this is Requests * DraftTokens.
+constexpr int MaxRows = 8;
 
 struct PeerMemory {
     unsigned int published[Ranks];
